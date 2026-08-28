@@ -110,6 +110,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# Agent session state (crash checkpoints, hand-off scratch) — never commit
+.state/
+
 # Spyder project settings
 .spyderproject
 .spyproject

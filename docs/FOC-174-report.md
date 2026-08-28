@@ -115,11 +115,12 @@ Bulleted findings describing the "before" state, each in one sentence:
   analytical (chi-squared / SelectKBest) and does not call `evaluateModel`. The
   three model notebooks, on the chronological/stratified test split:
 
-  | Notebook | PR-AUC | ROC-AUC | F1 (default thr) | Best-F1 thr | Recall@prec=0.50 |
-  |----------|--------|---------|------------------|-------------|------------------|
-  | nb3 (XGB) | 0.166 | 0.806 | 0.132 | 0.762 | low |
-  | nb4 (Dictionary) | 0.329 | 0.625 | 0.397 | 0.310 | — |
-  | nb5 (Combined dict→XGB) | 0.507 | 0.857 | 0.400 | 0.068 | 0.556 |
+  | Notebook | PR-AUC | ROC-AUC | F1 (frozen thr) | Threshold source | Recall@prec=0.50 |
+  |----------|--------|---------|------------------|------------------|------------------|
+  | nb3 (XGB, full feats) | 0.053 | 0.636 | 0.000 | 0.965 (val) | — |
+  | nb3 (XGB, selected feats) | 0.033 | 0.548 | 0.000 | 0.980 (val) | — |
+  | nb4 (Dictionary) | 0.329 | 0.625 | 0.397 | 0.310 (grid, train) | — |
+  | nb5 (Combined dict→XGB) | 0.507 | 0.857 | 0.400 | 0.068 (grid, train) | 0.556 |
 
   These are baseline numbers after the F0 fixes, not tuned production metrics —
   they establish the reproducible harness + consistent splits so F1+ can compare
@@ -127,6 +128,46 @@ Bulleted findings describing the "before" state, each in one sentence:
   `y_score` in nb4/nb5 (a continuous risk score), so their PR-AUC is directly
   comparable across the two-layer pipeline. nb5 (dict features → XGB) clearly
   dominates the pure dictionary model, as expected.
+
+  > The nb3 F1 of 0.0 is honest, not broken: the threshold is now tuned on a
+  > **validation split of TRAIN** (frozen) and applied once to the held-out test.
+  > `scale_pos_weight` inflates fraud probabilities on the val set, so the
+  > val-derived best-F1 threshold lands near ~0.97; on the test set that threshold
+  > yields zero positive predictions. PR-AUC (threshold-independent) is the correct
+  > ranking-quality read on nb3. This is exactly the leak-free behaviour the
+  > review required (see §1.5.1).
+
+### 1.5.1 Round-1 review fixes (leakage / correctness)
+
+Three blocking findings from the round-1 review, all fixed on this branch:
+
+- **FIX1 — nb2 broken inline FX (data-leakage via mis-pricing).** nb2 rolled its
+  own FX merge on `[ccy, date]` that never matched (`currency_rates.date` was a
+  string vs `trxns_data.date` a `datetime.date`), so all 5302 rates were NaN and a
+  silent `np.where(isna, 1)` priced every row at 1:1 — 88.9% of rows are non-EUR,
+  so `amount_eur` was the raw `amount`. nb2's SelectKBest ranking (which feeds
+  `my_feature_names` in nb3) was therefore built on mis-priced features. **Fix:**
+  nb2 now calls the shared `funs.dataPreparation` (which normalizes the date dtype,
+  joins real rates, sets EUR=1.0, flags FX-missing) instead of the inline merge.
+  Verified: a USD row now shows `amount 56691.27 → amount_eur 46514.01`.
+- **FIX2 — nb3 threshold tuned on the TEST set.** cells 43/55 derived
+  `best_threshold_f1` from `precision_recall_curve(y_test, y_proba)` and re-applied
+  it to the same `y_test` — optimistic bias, test no longer held out.
+  `evaluateModel` itself was correct. **Fix:** a validation set is carved from
+  TRAIN (`train_test_split(X_train, y_train, stratify=y_train)`), the threshold is
+  tuned on that val set and **frozen**, then the test set is evaluated exactly once
+  with the frozen threshold (no read-back of `best_threshold_f1` from the test
+  call). Both XGB passes (full + selected features) fixed.
+- **FIX3 — nb5 target left in the feature matrix.** cell 5 did `X = data` (alias)
+  then `data = data.drop(target)` — only rebinds the name, so `X`/`X_train`
+  physically still carried `fraud_flag_trans` (the 0/1 target). It reached no XGB
+  only by accident (a `dictionaryModel` whitelist omission). **Fix:** the target
+  column is dropped **before** `X` is assigned (`X = data.drop(columns=target).copy()`),
+  so the feature matrix cannot contain the label by construction. Note: the
+  original `fraud_flag` (Y/N) is intentionally retained on the frame because
+  `funs.dictionaryModel` needs it to build `fraud_flag_transformed`; it is dropped
+  from the XGB input frame before `get_dummies`. Verified: no `fraud_flag*` column
+  is present in `model_train_data` (94 cols).
 
 ### 1.6 Open items / notes
 
