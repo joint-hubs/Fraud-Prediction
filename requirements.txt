@@ -1,3 +1,4 @@
+# --- F0: core ML / analysis stack ---
 pandas
 numpy
 plotnine
@@ -12,3 +13,31 @@ requests
 beautifulsoup4
 jupyter
 nbconvert
+
+# --- F0: notebooks + imbalance handling ---
+imbalanced-learn
+ipykernel
+nbformat
+
+# --- F1: gradient boosting alternatives ---
+lightgbm
+catboost
+
+# --- F1: tabular deep learning (pinned — last PyPI release is 4.1.0) ---
+pytorch-tabnet==4.1.0
+
+# --- F2: time-series foundation model ---
+timesfm
+
+# --- F2: embeddings / text ---
+sentence-transformers
+
+# --- F2: face embeddings (lighter than deepface) ---
+facenet-pytorch
+
+# --- F2: stat-context (SCE) from joint-hubs/sce ---
+# Deferred — needs auth / GitHub access; install when F2 (SCE) work starts:
+# -e git+https://github.com/joint-hubs/sce.git#egg=stat-context
+
+# torch CUDA build — install separately, not from PyPI:
+# python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
