@@ -200,16 +200,22 @@ def dataPreparation(
     # Add the date and the exchange rate
     trxns_data["date"] = trxns_data["timestamp"].dt.date
     trxns_data = trxns_data.merge(currency_rates, on=["ccy", "date"], how="left")
-    # FX leakage fix: do NOT silently treat missing rates as 1:1 EUR (that would
-    # mis-price non-EUR rows at face value). Flag missing rates explicitly and
-    # leave amount_eur as NaN for those rows so downstream code cannot mistake a
-    # fabricated price for a real one.
-    trxns_data["amount_eur_fx_missing"] = trxns_data["rate"].isna()
+    # EUR is the base currency (see Currencies API.ipynb), so its rate is 1.0.
+    # The exchange_rates.csv has no EUR rows, so fill those in explicitly rather
+    # than flagging them as missing.
+    eur_mask = trxns_data["ccy"].eq("EUR")
+    trxns_data.loc[eur_mask, "rate"] = 1.0
     # Clean and convert the amount to EUR
     trxns_data["amount"] = trxns_data["amount"].apply(
         lambda x: float(re.sub("[^0-9.]", "", x))
     )
     trxns_data["amount_eur"] = trxns_data["amount"] / trxns_data["rate"]
+    # FX leakage fix: do NOT silently treat missing rates as 1:1 EUR (that would
+    # mis-price non-EUR rows at face value). Flag missing rates explicitly and
+    # leave amount_eur as NaN for those rows so downstream code cannot mistake a
+    # fabricated price for a real one. EUR rows are handled above (rate=1.0),
+    # so they are NOT flagged.
+    trxns_data["amount_eur_fx_missing"] = trxns_data["rate"].isna()
     # Extract the customer type from the customer id
     trxns_data["customer_type"] = trxns_data["customer"].str[0]
     # Extract the weekday, month, quarter and hour from the timestamp
