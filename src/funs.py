@@ -4,7 +4,18 @@ import re
 from scipy.stats import chi2_contingency
 import seaborn as sns
 import matplotlib.pyplot as plt
-from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    classification_report,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    average_precision_score,
+    precision_recall_curve,
+)
+from sklearn.model_selection import train_test_split, StratifiedKFold
 
 
 def chi2_independence(df, factor_col, fraud_col, type="description"):
@@ -173,6 +184,10 @@ def dataPreparation(
     currency_rates = pd.read_csv(
         exchange_rates_path, header=None, names=["ccy", "date", "rate"]
     )
+    # Normalize the rate date to a date object so it matches the trxns date type
+    # (trxns date comes from .dt.date; the rates CSV date is a string). Without
+    # this the merge on [ccy, date] joins on mismatched types and matches nothing.
+    currency_rates["date"] = pd.to_datetime(currency_rates["date"]).dt.date
 
     # Data Cleaning and Preprocessing
 
@@ -185,7 +200,11 @@ def dataPreparation(
     # Add the date and the exchange rate
     trxns_data["date"] = trxns_data["timestamp"].dt.date
     trxns_data = trxns_data.merge(currency_rates, on=["ccy", "date"], how="left")
-    trxns_data["rate"] = np.where(trxns_data["rate"].isna(), 1, trxns_data["rate"])
+    # FX leakage fix: do NOT silently treat missing rates as 1:1 EUR (that would
+    # mis-price non-EUR rows at face value). Flag missing rates explicitly and
+    # leave amount_eur as NaN for those rows so downstream code cannot mistake a
+    # fabricated price for a real one.
+    trxns_data["amount_eur_fx_missing"] = trxns_data["rate"].isna()
     # Clean and convert the amount to EUR
     trxns_data["amount"] = trxns_data["amount"].apply(
         lambda x: float(re.sub("[^0-9.]", "", x))
@@ -213,8 +232,10 @@ def dataPreparation(
         trxns_data["counterparty_country"],
     )
 
-    # Calculate the thresholds for the equally sized buckets of the amount in EUR
-    amount_eur_quantile = np.quantile(
+    # Calculate the thresholds for the equally sized buckets of the amount in EUR.
+    # Use nanquantile so rows with a missing FX rate (amount_eur_fx_missing) are
+    # excluded from the bin-edge computation rather than poisoning it with NaN.
+    amount_eur_quantile = np.nanquantile(
         trxns_data["amount_eur"], q=np.arange(0, 1.2, 0.2)
     )
 
@@ -380,16 +401,47 @@ def createDictionary(trxns_data, colname="weekday", count_filter=5):
     return result_table
 
 
-def evaluateModel(y_test, y_pred):
-    # Calculate the accuracy score
-    accuracy = accuracy_score(y_test, y_pred)
+def evaluateModel(y_test, y_pred, y_score=None, target_precision=0.5):
+    # Fraud-evaluation harness.
+    #
+    # Backward compatible: evaluateModel(y_test, y_pred) keeps the legacy
+    # behaviour (accuracy, confusion matrix, classification_report) so existing
+    # notebook callers are unaffected. Accuracy is deliberately demoted from
+    # headline status — on a ~1.7% positive rate it is misleading.
+    #
+    # Rich path: pass y_score (positive-class probabilities) to also compute
+    # PR-AUC, ROC-AUC, F1/precision/recall, recall@target_precision (the recall
+    # achievable at the threshold that first meets target_precision on the
+    # precision-recall curve), the best F1 threshold, and a precision-recall
+    # curve plot. Returns a result dict; the legacy path returns None.
+    y_test_arr = np.asarray(y_test).ravel()
+    y_pred_arr = np.asarray(y_pred).ravel()
+
+    # Guard against empty inputs: return a clearly empty result rather than
+    # raising, matching the repo's no-exception convention.
+    if y_test_arr.size == 0 or y_pred_arr.size == 0:
+        if y_score is None:
+            return None
+        return {
+            "accuracy": float("nan"),
+            "precision": float("nan"),
+            "recall": float("nan"),
+            "f1": float("nan"),
+            "roc_auc": float("nan"),
+            "pr_auc": float("nan"),
+            "best_threshold_f1": float("nan"),
+            "recall_at_precision": float("nan"),
+            "target_precision": target_precision,
+        }
+
+    accuracy = accuracy_score(y_test_arr, y_pred_arr)
 
     # Create confusion matrix
-    cm = confusion_matrix(y_test, y_pred)
+    cm = confusion_matrix(y_test_arr, y_pred_arr)
 
     # Create classification report
     # https://developers.google.com/machine-learning/crash-course/classification/precision-and-recall
-    cr = classification_report(y_test, y_pred)
+    cr = classification_report(y_test_arr, y_pred_arr)
 
     labels = ["0", "1"]
 
@@ -414,11 +466,189 @@ def evaluateModel(y_test, y_pred):
     plt.ylabel("True label")
     plt.xlabel("Predicted label")
     plt.tight_layout()
-
     plt.show()
 
     print("\nAccuracy: %.2f%%" % (accuracy * 100.0), "\n")
     print(cr)
+
+    # Legacy-only path: no probabilities, nothing richer to compute.
+    if y_score is None:
+        return None
+
+    y_score_arr = np.asarray(y_score).ravel()
+
+    precision, recall, thresholds = precision_recall_curve(y_test_arr, y_score_arr)
+    pr_auc = average_precision_score(y_test_arr, y_score_arr)
+    roc_auc = roc_auc_score(y_test_arr, y_score_arr)
+
+    # Best threshold by F1: precision_recall_curve omits the threshold for the
+    # last (precision=1, recall=0) point, so guard the index.
+    f1_scores = 2 * precision * recall / (precision + recall + 1e-12)
+    best_idx = int(np.nanargmax(f1_scores[:-1])) if len(thresholds) > 0 else 0
+    best_threshold_f1 = float(thresholds[best_idx]) if len(thresholds) > 0 else 0.5
+
+    # Recall at target precision: highest recall whose precision first meets the
+    # target, scanning from high threshold (high precision) down.
+    prec_arr = precision[:-1] if len(thresholds) > 0 else precision
+    rec_arr = recall[:-1] if len(thresholds) > 0 else recall
+    meets = prec_arr >= target_precision
+    recall_at_precision = float(rec_arr[meets].max()) if meets.any() else 0.0
+
+    # Precision-recall curve plot
+    plt.figure(figsize=(6, 4))
+    plt.plot(recall, precision, color="darkorange", lw=2, label="PR curve")
+    plt.scatter(
+        [recall[best_idx]],
+        [precision[best_idx]],
+        color="red",
+        zorder=5,
+        label="best F1 (t=%.3f)" % best_threshold_f1,
+    )
+    plt.axhline(target_precision, color="grey", linestyle="--", linewidth=1)
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title("Precision-Recall Curve (PR-AUC=%.3f)" % pr_auc)
+    plt.legend(loc="upper right")
+    plt.tight_layout()
+    plt.show()
+
+    result = {
+        "accuracy": float(accuracy),
+        "precision": float(precision_score(y_test_arr, y_pred_arr, zero_division=0)),
+        "recall": float(recall_score(y_test_arr, y_pred_arr, zero_division=0)),
+        "f1": float(f1_score(y_test_arr, y_pred_arr, zero_division=0)),
+        "roc_auc": float(roc_auc),
+        "pr_auc": float(pr_auc),
+        "best_threshold_f1": best_threshold_f1,
+        "recall_at_precision": recall_at_precision,
+        "target_precision": target_precision,
+    }
+
+    print(
+        "PR-AUC=%.4f  ROC-AUC=%.4f  F1=%.4f  Precision=%.4f  Recall=%.4f"
+        % (
+            result["pr_auc"],
+            result["roc_auc"],
+            result["f1"],
+            result["precision"],
+            result["recall"],
+        )
+    )
+    print(
+        "Best F1 threshold=%.4f  Recall@precision=%.2f=%.4f"
+        % (best_threshold_f1, target_precision, recall_at_precision)
+    )
+
+    return result
+
+
+def chronological_split(X, y, timestamp=None, test_size=0.2, random_state=42):
+    # Chronological (time-based) train/test split for fraud evaluation.
+    #
+    # Why chronological: random shuffling leaks the future into training (a model
+    # can learn temporal patterns it should not have seen). With a ~1-year
+    # transaction window we sort by timestamp and cut at a date boundary so the
+    # test set is strictly LATER than train — closer to how the model is used.
+    #
+    # Pass a timestamp series (same index as X/y) to get the chronological path.
+    # When no timestamp is given, fall back to a stratified random split
+    # (train_test_split with stratify=y), which preserves the ~1.7% positive
+    # rate in both folds — appropriate for severe class imbalance.
+    #
+    # Returns X_train, X_test, y_train, y_test.
+    if timestamp is None:
+        return train_test_split(
+            X, y, test_size=test_size, random_state=random_state, stratify=y
+        )
+
+    ts = pd.Series(timestamp)
+    if ts.isna().any():
+        raise ValueError("timestamp contains NaN values; cannot sort chronologically")
+
+    sort_index = ts.sort_values().index
+    n_test = int(np.ceil(len(sort_index) * test_size))
+    if n_test < 1:
+        raise ValueError("test_size too small for the provided data length")
+    train_idx = sort_index[:-n_test]
+    test_idx = sort_index[-n_test:]
+
+    return (
+        X.loc[train_idx],
+        X.loc[test_idx],
+        y.loc[train_idx],
+        y.loc[test_idx],
+    )
+
+
+def cross_validate_model(
+    model, X, y, k=5, stratified=True, shuffle=True, random_state=42
+):
+    # k-fold cross-validation returning per-fold metrics + mean/std.
+    #
+    # Uses StratifiedKFold by default — mandatory for the ~1.7% positive class,
+    # where plain KFold could leave a fold with zero frauds. Works for any
+    # sklearn-compatible model exposing fit + predict_proba (the positive-class
+    # probability is what drives PR-AUC / ROC-AUC).
+    #
+    # Returns a dict with per-fold arrays and mean/std summaries.
+    y_arr = np.asarray(y).ravel()
+
+    if stratified:
+        splitter = StratifiedKFold(
+            n_splits=k, shuffle=shuffle, random_state=random_state
+        )
+    else:
+        from sklearn.model_selection import KFold
+
+        splitter = KFold(n_splits=k, shuffle=shuffle, random_state=random_state)
+
+    folds = []
+    X_df = pd.DataFrame(X) if not isinstance(X, pd.DataFrame) else X
+    for fold, (train_idx, test_idx) in enumerate(splitter.split(X_df, y_arr), start=1):
+        X_tr, X_te = X_df.iloc[train_idx], X_df.iloc[test_idx]
+        y_tr, y_te = y_arr[train_idx], y_arr[test_idx]
+
+        fitted = (
+            model.__class__(**model.get_params())
+            if hasattr(model, "get_params")
+            else model
+        )
+        fitted.fit(X_tr, y_tr)
+
+        y_pred = fitted.predict(X_te)
+        if hasattr(fitted, "predict_proba"):
+            y_score = fitted.predict_proba(X_te)[:, 1]
+        elif hasattr(fitted, "decision_function"):
+            y_score = fitted.decision_function(X_te)
+        else:
+            y_score = y_pred.astype(float)
+
+        fold_metrics = {
+            "fold": fold,
+            "precision": float(precision_score(y_te, y_pred, zero_division=0)),
+            "recall": float(recall_score(y_te, y_pred, zero_division=0)),
+            "f1": float(f1_score(y_te, y_pred, zero_division=0)),
+            "accuracy": float(accuracy_score(y_te, y_pred)),
+        }
+        # PR-AUC / ROC-AUC need a score, not hard labels.
+        try:
+            fold_metrics["pr_auc"] = float(
+                average_precision_score(y_te, y_score)
+            )
+            fold_metrics["roc_auc"] = float(roc_auc_score(y_te, y_score))
+        except ValueError:
+            fold_metrics["pr_auc"] = float("nan")
+            fold_metrics["roc_auc"] = float("nan")
+        folds.append(fold_metrics)
+
+    folds_df = pd.DataFrame(folds)
+    summary = {}
+    for col in ["precision", "recall", "f1", "accuracy", "pr_auc", "roc_auc"]:
+        if col in folds_df.columns:
+            summary[col + "_mean"] = float(folds_df[col].mean())
+            summary[col + "_std"] = float(folds_df[col].std())
+
+    return {"folds": folds_df, "summary": summary}
 
 
 def dictionaryModel(
