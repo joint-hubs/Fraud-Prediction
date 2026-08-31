@@ -504,13 +504,38 @@ register_arm(
     build_features=_features_gbdt_ensemble,
     supports_cv=True,
 )
+def _features_tabnet(enriched):
+    # nb10 arm input: the xgb-client matrix with LightGBM-safe column names
+    # (arms_gbdt.sanitize_feature_names) — the exact frame gbdt-ensemble
+    # consumes, so the two F3 arms stay feature-identical (n_features 116;
+    # values and column order unchanged, only names mapped).
+    import arms_gbdt  # lazy: keeps module import light
+
+    return arms_gbdt.sanitize_feature_names(_features_xgb_client(enriched))
+
+
+def _make_tabnet(y_fit):
+    # F3 nb10 arm (src/arms_tabnet.py): TabNetClassifier (pytorch-tabnet) on the
+    # base+client feature set, CUDA when available else CPU. Lazy sibling
+    # import — this module must load without torch/pytorch_tabnet installed
+    # (other machines), and a missing dependency surfaces as a SKIPPED row
+    # (ArmSkipped), never a crash.
+    import arms_tabnet  # lazy: imports torch/pytorch_tabnet only inside fit()
+
+    missing = arms_tabnet.check_dependencies()
+    if missing is not None:
+        raise ArmSkipped("tabnet: missing dependency (%s)" % missing)
+    return arms_tabnet.make_tabnet(y_fit)
+
+
 register_arm(
     "tabnet",
-    "TabNet on base+client features",
-    make_model=None,
-    build_features=None,
+    "TabNet (pytorch-tabnet 4.1.0) on base+client features (nb10 arm); early "
+    "stopping on an internal stratified carve — CV off by default ([no-cv]): "
+    "per-fold GPU refits are not worth it at this scale",
+    make_model=_make_tabnet,
+    build_features=_features_tabnet,
     supports_cv=False,
-    placeholder=True,
 )
 register_arm(
     "timesfm-features",
