@@ -586,6 +586,83 @@ def chronological_split(X, y, timestamp=None, test_size=0.2, random_state=42):
     )
 
 
+def grouped_split(X, y, groups, timestamp=None, test_size=0.2, random_state=42):
+    # Customer-grouped train/test split: no customer appears in both folds.
+    #
+    # Why grouped: chronological_split separates rows in time but can place the
+    # same customer in both folds, so the model can score on memorized
+    # customer-specific behaviour (identity leakage). Here every row of a
+    # customer lands on one side — a hard disjointness invariant — separating
+    # identity memorization from transferable signal (docs/FOC-174-report.md
+    # §2.7).
+    #
+    # Boundary rule (timestamp given): customers are ordered by their first-seen
+    # transaction (min timestamp over their rows); ties on an identical
+    # first-seen timestamp are broken by customer id, so the ordering is fully
+    # deterministic. The last ceil(n_customers * test_size) customers in that
+    # order form the test set — every test customer's first transaction is at or
+    # after every train customer's first transaction (train occurs earlier by
+    # construction). random_state is unused on this path.
+    #
+    # Without a timestamp there is NO chronological guarantee: customers are
+    # assigned randomly (train_test_split seeded with random_state) — disjoint,
+    # but unordered in time. groups must be a Series/array aligned with X/y and
+    # free of NaN (same strictness as timestamp); ValueError is raised on empty
+    # or NaN groups, on NaN timestamps, or when test_size cannot produce both a
+    # non-empty test and a non-empty train customer set (e.g. one customer
+    # spans everything).
+    #
+    # Returns X_train, X_test, y_train, y_test (same convention as
+    # chronological_split).
+    grp = pd.Series(groups)
+    if len(grp) == 0:
+        raise ValueError("groups is empty; cannot form disjoint customer sets")
+    if grp.isna().any():
+        raise ValueError("groups contains NaN values; cannot form disjoint customer sets")
+
+    ids = grp.unique()
+    n_groups = len(ids)
+    n_test = int(np.ceil(n_groups * test_size))
+    if n_test < 1:
+        raise ValueError("test_size too small for the number of distinct customers")
+    if n_groups - n_test < 1:
+        raise ValueError(
+            "disjoint split impossible: not enough distinct customers for this "
+            "test_size (train customer set would be empty)"
+        )
+
+    if timestamp is None:
+        train_ids, test_ids = train_test_split(
+            ids, test_size=test_size, random_state=random_state
+        )
+    else:
+        ts = pd.Series(timestamp)
+        if ts.isna().any():
+            raise ValueError(
+                "timestamp contains NaN values; cannot sort chronologically"
+            )
+        # First-seen timestamp per customer; the (timestamp, customer) sort key
+        # is unique, so the customer order — and the split — is deterministic.
+        first_seen = (
+            pd.DataFrame({"group": grp.to_numpy(), "ts": ts.to_numpy()})
+            .groupby("group")["ts"]
+            .min()
+        )
+        ordered = first_seen.reset_index().sort_values(["ts", "group"])["group"]
+        train_ids = ordered.iloc[: n_groups - n_test].to_numpy()
+        test_ids = ordered.iloc[n_groups - n_test :].to_numpy()
+
+    train_mask = grp.isin(train_ids).to_numpy()
+    test_mask = grp.isin(test_ids).to_numpy()
+
+    return (
+        X.loc[train_mask],
+        X.loc[test_mask],
+        y.loc[train_mask],
+        y.loc[test_mask],
+    )
+
+
 def cross_validate_model(
     model, X, y, k=5, stratified=True, shuffle=True, random_state=42
 ):
