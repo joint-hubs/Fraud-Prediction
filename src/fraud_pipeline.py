@@ -473,13 +473,36 @@ register_arm(
 #   register_arm("tabnet", "...", make_model=_make_tabnet,
 #                build_features=_features_xgb_client, placeholder=False)
 
+def _features_gbdt_ensemble(enriched):
+    # nb9 arm input: the xgb-client matrix with LightGBM-safe column names
+    # (arms_gbdt.sanitize_feature_names — the amount_eur_bucket interval labels
+    # carry a comma, which LightGBM rejects). Same values and column order as
+    # _features_xgb_client; only names differ, so n_features matches.
+    import arms_gbdt  # lazy: keeps module import light
+
+    return arms_gbdt.sanitize_feature_names(_features_xgb_client(enriched))
+
+
+def _make_gbdt_ensemble(y_fit):
+    # F3 nb9 arm (src/arms_gbdt.py): XGB + LightGBM + CatBoost soft vote on the
+    # base+client feature set. Lazy sibling import — this module must load
+    # without lightgbm/catboost installed (other machines), and a missing
+    # dependency surfaces as a SKIPPED row (ArmSkipped), never a crash.
+    import arms_gbdt  # lazy: imports lightgbm/catboost only inside fit()
+
+    missing = arms_gbdt.check_dependencies()
+    if missing is not None:
+        raise ArmSkipped("gbdt-ensemble: missing dependency (%s)" % missing)
+    return arms_gbdt.make_ensemble(y_fit)
+
+
 register_arm(
     "gbdt-ensemble",
-    "GBDT ensemble (XGB + LightGBM + CatBoost) on base+client features",
-    make_model=None,
-    build_features=None,
-    supports_cv=False,
-    placeholder=True,
+    "GBDT ensemble (XGB + LightGBM + CatBoost) soft vote on base+client features "
+    "(nb9 arm); 3 x 200 trees per fit — cheap enough for full CV, members refit per fold",
+    make_model=_make_gbdt_ensemble,
+    build_features=_features_gbdt_ensemble,
+    supports_cv=True,
 )
 register_arm(
     "tabnet",

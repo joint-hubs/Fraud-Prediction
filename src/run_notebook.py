@@ -41,7 +41,8 @@ def main(argv=None):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     import nbformat
-    from nbclient import CellExecutionError, NotebookClient
+    from nbclient import NotebookClient
+    from nbclient.exceptions import CellExecutionError  # not re-exported at the root (nbclient 0.11)
 
     notebook = nbformat.read(nb_path, as_version=4)
     client = NotebookClient(
