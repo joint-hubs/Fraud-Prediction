@@ -663,6 +663,23 @@ def grouped_split(X, y, groups, timestamp=None, test_size=0.2, random_state=42):
     )
 
 
+def random_grouped_split(X, y, groups, test_size=0.2, random_state=42):
+    # Cohort-random customer-grouped split (FOC-175 primary axis): customers
+    # are assigned to train/test by a seeded random draw, so the split is
+    # customer-disjoint (same hard invariant as grouped_split) but carries no
+    # temporal ordering — unlike grouped_split's timestamp-ordered path, which
+    # always hands the latest-seen customers to the test set.
+    #
+    # Thin delegation to grouped_split's no-timestamp path (train_test_split on
+    # the distinct group ids, seeded with random_state): identical 4-tuple
+    # contract and error strictness. Kept as an explicitly named entry point so
+    # the random axis reads clearly at call sites and grouped_split's existing
+    # callers are untouched.
+    return grouped_split(
+        X, y, groups, timestamp=None, test_size=test_size, random_state=random_state
+    )
+
+
 def cross_validate_model(
     model, X, y, k=5, stratified=True, shuffle=True, random_state=42
 ):
