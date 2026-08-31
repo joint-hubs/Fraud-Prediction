@@ -1,43 +1,44 @@
+# Versions pinned with `==` were verified on this machine (Windows 11, Python
+# 3.11.9) via a fresh-venv install (pip freeze, exit-0) — FOC-177.
+
 # --- F0: core ML / analysis stack ---
-pandas
-numpy
-plotnine
-scikit-learn
-seaborn
-matplotlib
-graphviz
-xgboost
-dalex
-scipy
-requests
-beautifulsoup4
-jupyter
-nbconvert
+pandas==2.3.3
+numpy==2.4.6
+scikit-learn==1.7.2
+joblib==1.6.0
+seaborn==0.13.2
+matplotlib==3.11.1
+xgboost==2.1.4
+scipy==1.17.1
+jupyter==1.1.1
+jupyterlab==4.6.3
+notebook==7.6.2
+nbconvert==7.17.1
 
 # --- F0: notebooks + imbalance handling ---
-imbalanced-learn
-ipykernel
-nbformat
-
-# --- F1: gradient boosting alternatives ---
-lightgbm
-catboost
+imbalanced-learn==0.14.2
+ipykernel==7.3.0
+nbformat==5.11.1
 
 # --- F1: tabular deep learning (pinned — last PyPI release is 4.1.0) ---
 pytorch-tabnet==4.1.0
 
-# --- F2: time-series foundation model ---
-timesfm
-
-# --- F2: embeddings / text ---
-sentence-transformers
-
-# --- F2: face embeddings (lighter than deepface) ---
-facenet-pytorch
-
 # --- F2: stat-context (SCE) from joint-hubs/sce ---
-# Deferred — needs auth / GitHub access; install when F2 (SCE) work starts:
-# -e git+https://github.com/joint-hubs/sce.git#egg=stat-context
+# Available on PyPI (joint-hubs/sce, Apache-2.0); installs clean — version
+# verified on this machine:
+stat-context==0.4.0
+
+# --- Unpinned: resolve at F3/F4 install time; not yet version-verified ---
+plotnine
+graphviz
+dalex
+requests
+beautifulsoup4
+lightgbm
+catboost
+timesfm
+sentence-transformers
+facenet-pytorch
 
 # torch CUDA build — install separately, not from PyPI:
 # python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
