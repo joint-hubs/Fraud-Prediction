@@ -176,8 +176,6 @@ Three blocking findings from the round-1 review, all fixed on this branch:
 - `stat-context` (SCE) install deferred to F2.
 - F1–F5 libs installed best-effort; only `stat-context` was deferred.
 
-<!-- F0 complete; F1 appends §2. -->
-
 ## §2 F1 — Client enrichment (synthetic dim_customer)
 
 F1 asks the phase's real R&D question: does a client dimension table — joined
@@ -312,4 +310,198 @@ ranking quality, so the lift is not a threshold artifact.
   draw (§2.2), kept for future draws.
 - nb7 executes end-to-end via nbconvert (exit 0), including the in-run
   determinism assertion and the row-identical A/B split assertion.
+
+## §3 F2 — SCE context enrichment (cross-fitted statistics)
+
+F2 asks the phase's R&D question: does leakage-safe context enrichment —
+per-group fraud-rate statistics computed by a cross-fitted engine — beat the
+client-identity signal of §2 and the dictionary signal of nb4/nb5? The engine
+is `stat-context` 0.4.0 (upstream `joint-hubs/sce`), driven through the F0
+harness in a four-arm comparison (`src/8. SCE Enrichment.ipynb`, "nb8" below)
+on both the chronological split and a NEW customer-grouped split. Verdict up
+front: **no — the SCE arm underperforms even the un-enriched baseline on the
+chronological split, and on the customer-grouped split every arm measured in
+F0–F2 collapses to at-or-below chance.** The negative result is the finding:
+what the program has measured so far is identity- and period-memorization,
+not transferable fraud detection (§3.6).
+
+### 3.1 Environment
+
+- `stat-context` 0.4.0, installed from **PyPI** (public wheel; upstream
+  project `joint-hubs/sce`, Apache-2.0). Installed from PyPI, not from
+  GitHub, and no substitute implementation was used — the §1.1 deferral
+  ("needs auth") was resolved by the public wheel.
+- nb8 runs on the same environment as §2 (system Python 3.13.7, kernel
+  `fraud-f0`: pandas 2.3.3, scikit-learn 1.7.2, xgboost 2.1.4); no further
+  new dependencies. nb8 is the executed source of every number in this
+  section (commit a7e3dd7).
+- Target is binary fraud (0/1); the engine computes per-group fraud-rate
+  statistics (mean/count aggregations) over declared groupings.
+
+### 3.2 Method — cross-fitted context features
+
+- **Engine config.** `min_group_size=5`, aggregations MEAN+COUNT,
+  `include_interactions=True` (pairs, max depth 2), global stats on,
+  `include_relative_features=False` (the library itself warns this causes
+  target leakage), `include_fold_variance=False` (only meaningful for the
+  random strategy), `random_state=42`.
+- **Leakage safety via time cross-fitting.** `use_cross_fitting=True`,
+  `cross_fit_strategy="time"`, `time_col=timestamp`, `n_folds=5`: the engine
+  sorts by time and runs `TimeSeriesSplit`, and each fold's group statistics
+  are computed on that fold's train rows only — every row's context features
+  are strictly past-only.
+- **Documented artifact, verified in-run.** The earliest ≈ 1/(n_folds+1) ≈
+  17% of fitting rows keep NaN context features (they precede every fold's
+  statistics source) and back off to the global fraud mean. The
+  leakage-verification cell asserts that flipping targets after a
+  60th-percentile time cut leaves pre-cut rows' features bit-identical (the
+  control confirms post-cut rows do move), and that unseen groups at
+  `transform()` back off to the global fraud mean.
+- **Groupings — 18, all present in the data (none invented).** 10
+  transaction categoricals (the nb3 base set: `customer_country`,
+  `counterparty_country`, `type`, `ccy`, `customer_type`, `weekday`,
+  `month`, `quarter`, `hour`, `amount_eur_bucket`) + 6 client categoricals
+  from §2's `dim_customer` (`gender`, `employment_industry`,
+  `employment_status`, `income_band`, `device`, `channel`) + 2 binned client
+  numerics (`age_band`, edges 17/25/40/55/120; `tenure_band`, edges
+  −1/2/7/15/100).
+- **The customer id itself is deliberately excluded** — a per-customer fraud
+  rate would re-import exactly the identity signal §2 measured, defeating
+  the point of the leakage-safe arm.
+- Column count reconciles cleanly: 18 singles + 153 pairwise interactions
+  (C(18,2)) + 1 global = **172 grouping level-sets**; with MEAN and COUNT
+  aggregations each, **344 statistic columns**.
+
+### 3.3 Engine dtype quirk (found & worked around)
+
+- stat-context 0.4.0's out-of-fold assignment string-casts converted-dtype
+  grouping columns (int `hour` → str `hour`, `Interval` `amount_eur_bucket`
+  → str) while untouched rows keep their original values — mixed int/str
+  within one column. This fragments engine groups (24 `hour` groups became
+  48) and makes downstream one-hot encoding emit duplicate column names.
+- **Fix:** all grouping columns are normalized to str at the engine boundary
+  (`timestamp` keeps its dtype). Worth reporting upstream to
+  `joint-hubs/sce` (§3.7); the workaround is documented in the notebook.
+
+### 3.4 Experiment design — four arms × two splits
+
+- Four arms run through the shared F0 harness (`src/funs.py`) under nb7's
+  §2 protocol: identical row splits across arms (asserted), a 25% stratified
+  validation carve from train, XGBClassifier with §2's fixed
+  hyperparameters, `scale_pos_weight` = neg/pos, F1-optimal threshold frozen
+  on validation, one-shot test evaluation, stratified 5-fold CV on train.
+- **Arms:**
+  - **(a) base** — the 10 base transaction features (87 encoded), as §2.
+  - **(b) base + client** — the 8 raw `dim_customer` columns added (116
+    encoded); identical to §2's arm (b).
+  - **(c) base + SCE** — base features plus the 344 cross-fitted context
+    statistics; the SCE engine is **refit inside every CV fold** (custom
+    sklearn-compatible wrapper; `transform()` for validation/test), so the
+    CV scores are leakage-safe too.
+  - **(d) base + dictionary** — nb5-style dictionary scores as features;
+    dictionaries and thresholds built on train rows only.
+- **Two splits for every arm:**
+  - **Chronological** — last ceil(20%) = 1061 rows as test (the §1/§2
+    convention).
+  - **Customer-grouped (new `grouped_split` in `funs.py`)** — customers
+    ordered by first-seen transaction (ties broken by id), last ceil(20%) =
+    **20 of 100 customers** → test; train/test customers are disjoint.
+    Granularity is customer-entry-time, not row granularity (§3.7).
+
+### 3.5 Results
+
+Test metrics use each arm's frozen validation threshold; CV is stratified
+5-fold on the train split. Δ is the arm's test PR-AUC minus arm (a)'s.
+
+Chronological split (last 1061 rows as test):
+
+| Arm | Test PR-AUC | Test ROC-AUC | Test F1 (frozen thr) | Recall@prec=0.50 | CV PR-AUC (train) | Encoded features | Δ PR-AUC vs (a) |
+|-----|-------------|--------------|----------------------|------------------|-------------------|------------------|-----------------|
+| a: base | 0.0532 | 0.6361 | 0.0000 | 0.0417 | 0.4633 ± 0.0660 | 87 | — |
+| b: base + client | 0.2374 | 0.7692 | 0.2667 | 0.2083 | 0.5227 ± 0.0809 | 116 | +0.1842 |
+| c: base + SCE | 0.0340 | 0.5542 | 0.0000 | 0.0000 | 0.2214 ± 0.1415 | 429 | −0.0192 |
+| d: base + dictionary | 0.1034 | 0.7653 | 0.0769 | 0.0417 | 0.3539 ± 0.0814 | 92 | +0.0502 |
+
+Honesty notes on this table. First, arms a and c show F1 = 0.0000 — the
+known frozen-threshold artifact (§1.5.1, §2.5), not a new defect:
+`scale_pos_weight` inflates fraud probabilities on the validation carve, the
+val-tuned threshold lands high, and applied once to test it yields zero
+positive predictions; PR-AUC (threshold-independent) is the ranking read,
+and by that read arm c is the worst arm, not a tied one. Second, encoded
+feature counts for arms c and d differ slightly between splits (c: 429 here
+vs 431 grouped; d: 92 vs 94) — the SCE engine and the dictionaries are fit
+per split on that split's train rows, so emitted column counts can differ;
+the per-column difference was not itemized in the run. Third, arms a/b
+reproduce §2.5's test numbers exactly (0.0532 / 0.2374 — the harness
+consistency check passes); arm a's CV aggregate matches §2.5 exactly too,
+while arm b's lands a third decimal off (0.5227 ± 0.0809 vs 0.5253 ±
+0.0837) — nb8 re-runs the pipeline within this phase's single run, and only
+the test-side numbers are claimed as reproductions.
+
+Customer-grouped split (20 held-out customers as test):
+
+| Arm | Test PR-AUC | Test ROC-AUC | Test F1 (frozen thr) | Recall@prec=0.50 | CV PR-AUC (train) | Encoded features | Δ PR-AUC vs (a) |
+|-----|-------------|--------------|----------------------|------------------|-------------------|------------------|-----------------|
+| a: base | 0.0101 | 0.3152 | 0.0000 | 0.0000 | 0.6202 ± 0.0959 | 87 | — |
+| b: base + client | 0.0091 | 0.2543 | 0.0000 | 0.0000 | 0.7277 ± 0.0599 | 116 | −0.0010 |
+| c: base + SCE | 0.0119 | 0.3670 | 0.0000 | 0.0000 | 0.4532 ± 0.1693 | 431 | +0.0018 |
+| d: base + dictionary | 0.0123 | 0.4338 | 0.0000 | 0.0000 | 0.4786 ± 0.1349 | 94 | +0.0022 |
+
+Honesty note on this table: every test number is at or below the 0.0172
+prevalence — a random ranking lands near prevalence on PR-AUC and at 0.5 on
+ROC-AUC, and all four arms are below both. F1 = 0.0000 across the board is
+again partly the frozen-threshold artifact, but unlike the chronological
+table the PR-AUC/ROC-AUC columns show the ranking itself fails, so this is
+not a threshold story. The CV column is the tell: stratified 5-fold CV mixes
+customers across folds, so within-customer signal survives there (b:
+0.7277) while the customer-disjoint test collapses. At this scale the Δ
+column distinguishes nothing — all arms sit in a 0.009–0.012 band at or
+below the prevalence baseline.
+
+### 3.6 Interpretation (honest read)
+
+- **Chronological ranking: client (b, 0.2374) > dictionary (d, 0.1034) >
+  base (a, 0.0532) > SCE (c, 0.0340). The F2 question — does leakage-safe
+  enrichment beat the dictionary signal? — is answered NO.** SCE
+  underperforms even the un-enriched baseline (Δ −0.0192 PR-AUC vs base,
+  −0.0695 vs the dictionary arm, as measured in the run).
+- **Why SCE loses here — hypotheses, stated honestly (not established
+  causes):** 344 sparse statistic columns against ~73 positives in the
+  chronological train split; heavy group fragmentation under
+  `min_group_size=5` (172 level-sets on 5.3k rows); the time strategy's NaN
+  head (≈17% of fitting rows) backs off to the global mean; fixed XGB
+  hyperparameters (nothing was tuned for any arm, by the nb7 discipline);
+  frozen-threshold artifacts drive F1 to 0 for arms a and c. CV agrees: arm
+  c has the lowest CV PR-AUC (0.2214) with the highest variance (±0.1415).
+- **Customer-grouped split: everything collapses.** All four arms land at
+  PR-AUC 0.009–0.012 against a 0.0172 prevalence — i.e. at or below random —
+  and ROC-AUC 0.25–0.44 is below chance. The §2 winner (client features,
+  0.2374) collapses hardest (→ 0.0091); the dictionary collapses too
+  (0.1034 → 0.0123); SCE is no better (0.0119). **No signal measured in
+  F0–F2 survives customer-disjoint evaluation: what looked like fraud
+  detection is identity- and period-memorization.**
+- **Train-side CV makes it explicit.** On the grouped split, CV PR-AUC stays
+  high (b: 0.7277, a: 0.6202) while test collapses — the identity signal is
+  real within known customers and transfers to no one.
+- **Historical context — do not over-claim.** nb4 (0.329) / nb5 (0.507) used
+  nb5's own protocol with a grid-searched XGB. This phase's fixed-parameter
+  dictionary arm (d) reaches 0.1034 on the same chronological split — most
+  of that gap is protocol (tuning), not signal; 0.507 is not comparable to
+  the tables above.
+
+### 3.7 Open items / notes
+
+- The SCE arm was not tuned (fixed XGB parameters everywhere, per the nb7
+  discipline); a feature-selection pass over the 344 SCE columns and per-arm
+  tuning are natural follow-ups — as is F3's model-experiment phase.
+- The engine dtype quirk (§3.3) deserves an upstream issue at
+  `joint-hubs/sce`; the workaround is documented in the notebook.
+- `grouped_split` guarantees customer-entry-time ordering, not row-level
+  separation — documented in `funs.py`.
+- **Program reframe (the actionable outcome of this phase):** before any F3
+  model work, the evaluation axis that matters is the customer-grouped
+  split; every F3/F4 candidate must be judged there, not on the
+  chronological split.
+
+<!-- F0-F2 complete; F3 appends §4. -->
 
