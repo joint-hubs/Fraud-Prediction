@@ -177,3 +177,139 @@ Three blocking findings from the round-1 review, all fixed on this branch:
 - F1–F5 libs installed best-effort; only `stat-context` was deferred.
 
 <!-- F0 complete; F1 appends §2. -->
+
+## §2 F1 — Client enrichment (synthetic dim_customer)
+
+F1 asks the phase's real R&D question: does a client dimension table — joined
+onto transactions by the anonymous `customer` id — move the XGB baseline?
+Phase decision D3 forbids PII, so the client table is fully synthetic: every
+attribute is a deterministic draw seeded by the customer id. Chunk A (nb7)
+built the table and the join; chunk B answers the question with a controlled
+A/B evaluation through the F0 harness. Verdict up front: **client enrichment
+moves the measured baseline (test PR-AUC 0.0532 → 0.2374), but the honest
+reading is customer-identity signal, not transferable demographic signal** —
+see §2.6.
+
+### 2.1 Environment
+
+- nb7 runs on system Python 3.13.7 (kernel `fraud-f0`): pandas 2.3.3,
+  scikit-learn 1.7.2, xgboost 2.1.4. The F0 `.venv` (Python 3.11) is unusable
+  in this worktree — Windows App Control blocks its pandas DLLs — so all
+  metrics are re-established within this single run, and absolute numbers may
+  differ slightly from §1.5. The A/B delta is computed within this one run and
+  is internally consistent. Encouragingly, the in-run arm-(a) baseline lands
+  within rounding of §1.5's nb3 numbers (PR-AUC 0.0532 vs 0.053, ROC-AUC
+  0.6361 vs 0.636, F1 0.000, frozen threshold 0.9652 vs 0.965).
+- No new dependencies; `funs.py` untouched; evaluation only through the F0
+  harness (`chronological_split`, `cross_validate_model`, `evaluateModel`),
+  with accuracy demoted per the F0 convention.
+
+### 2.2 Method — synthetic `dim_customer`
+
+- **Determinism via SHA-256 → seed.** Each attribute draw comes from a
+  `random.Random` instance seeded with the SHA-256 of the customer id, so the
+  seed travels with the id — same id → same profile on every run and machine,
+  with no global seed to lose. `generate_dim_customer()` is a pure function of
+  the id list; nb7 builds it twice and asserts the two frames identical (an
+  in-run determinism guard).
+- **Distributions.** Age ~ N(45, 15) clipped to [18, 85] (drawn mean 44.3,
+  range 18–82); employment status follows age (students young, retirees old);
+  income ~ lognormal, banded into 6 ordinal bands whose `1_`–`6_` label
+  prefixes keep sort order == band order; account tenure grows with age
+  (drawn age/tenure correlation 0.79); device/channel mobile-first skews.
+  Every categorical stays ≤ 8 levels so one-hot encoding stays compact on 100
+  customers.
+- **Sampling artifact (no fix needed).** The `5_90k_140k` income band has 0
+  customers in this 100-customer draw — a natural consequence of the
+  lognormal draw at this sample size. The band stays in the label space for
+  future draws; nothing downstream breaks on the empty level.
+- **D3 (no PII).** Attributes are fully synthetic: no names, emails or
+  account numbers; the only key is the anonymous `customer` id.
+
+### 2.3 Join
+
+- `dataPreparation()` output (5302 × 19) is left-merged with `dim_customer`
+  (100 × 9) on `customer`, validated as `many_to_one` (many transactions per
+  single customer row) → enriched frame **5302 × 27**.
+- Sanity checks pass: no rows lost, the customer set is unchanged, and the 8
+  new columns introduce zero nulls.
+
+### 2.4 A/B experiment design
+
+- **Arm (a) baseline** — the 10 base transaction features of nb3
+  (`customer_country`, `counterparty_country`, `type`, `ccy`, `customer_type`,
+  `weekday`, `month`, `quarter`, `hour`, `amount_eur_bucket`), one-hot encoded
+  exactly as nb3 (87 encoded features).
+- **Arm (b) enriched** — the same 10 features plus the 8 client columns;
+  `age` and `account_tenure_years` pass through as numbers, the 6 categorical
+  client columns go through the same `get_dummies` flow (116 encoded
+  features).
+- Everything except the feature matrix is IDENTICAL between arms: same `y`
+  (`fraud_flag` → {N:0, Y:1}), same chronological split (same timestamps,
+  `test_size=0.2`, `random_state=42` — asserted row-identical between arms),
+  same validation carve from TRAIN (`test_size=0.25`, stratified), same
+  stratified 5-fold CV on the chronological train split, same XGB
+  hyperparameters (lr 0.05, depth 6, 200 trees, `reg_lambda=1.0`,
+  `scale_pos_weight` = neg/pos on the fit split, `eval_metric="logloss"`),
+  same threshold procedure (tuned on the validation split via
+  `evaluateModel`'s `best_threshold_f1`, frozen, applied once to test).
+- One encoding accommodation: XGBoost forbids `[`, `]` and `<` in feature
+  names. nb3 already stripped `[`/`]` (amount-bucket intervals); nb7
+  additionally maps the `<` in the `1_<20k` income-band label.
+
+### 2.5 Results
+
+Test metrics use each arm's frozen validation threshold; CV is stratified
+5-fold on the chronological train split. Δ is arm (b) − arm (a).
+
+| Metric | (a) base features | (b) base + client | Δ (b−a) |
+|--------|-------------------|-------------------|---------|
+| Test PR-AUC | 0.0532 | 0.2374 | +0.1842 |
+| Test ROC-AUC | 0.6361 | 0.7692 | +0.1331 |
+| Test F1 (frozen threshold) | 0.0000 | 0.2667 | +0.2667 |
+| Test recall@precision=0.50 | 0.0417 | 0.2083 | +0.1667 |
+| CV PR-AUC mean±std (train) | 0.4633 ± 0.0660 | 0.5253 ± 0.0837 | +0.0620 |
+| Frozen threshold (tuned on val) | 0.9652 | 0.6648 | −0.3004 |
+| Encoded features | 87 | 116 | +29 |
+
+Two honesty notes on the table. First, arm (a)'s F1 of 0.0000 repeats the
+§1.5.1 behaviour, not a new defect: `scale_pos_weight` inflates fraud
+probabilities on the val split, the val-tuned threshold lands at 0.9652, and
+applied to test it yields zero positive predictions. Second, arm (b)'s F1
+gain partly rides on its threshold landing at a usable 0.6648 (test precision
+0.667 / recall 0.167) — but the PR-AUC gain (+0.1842) is threshold-independent
+ranking quality, so the lift is not a threshold artifact.
+
+### 2.6 Interpretation (honest read)
+
+- **Memorization caveat.** Every client attribute is a deterministic function
+  of the `customer` id, so the 8 columns act as a low-cardinality proxy for
+  customer identity. The chronological split does not hold customers out —
+  customers appearing in both the train and test windows carry identical
+  attribute vectors — so the measured lift may reflect customer-identity
+  memorization rather than transferable demographic signal.
+- **Low cardinality, constant per customer.** 100 unique customers carry 91
+  fraud transactions (~1.72% positive rate); each client feature has ≤ 8
+  levels and is constant within a customer, so the model can learn at most a
+  per-customer prior. The A/B difference is dominated by which customers
+  happen to fall into the later test window, not by demographics that would
+  generalize to new customers.
+- **Where the evidence points.** CV PR-AUC improves too, but far less
+  (+0.0620 vs +0.1842 on test); both comparisons mix customers across folds,
+  so neither isolates transferable signal. Verdict in plain words: client
+  enrichment **moves** the measured baseline, and the signal it adds is best
+  described as **who the customer is**, not **what kind of customer they are**.
+
+### 2.7 Open items / notes
+
+- A customer-grouped (disjoint) train/test split would cleanly separate
+  memorization from transferable demographic signal — candidate follow-up
+  before any claim that client demographics help fraud detection.
+- The synthetic attributes are a stand-in for real client data; when a real
+  `dim_customer` lands, the same A/B protocol (identical-splits assertion,
+  val-frozen threshold) is directly reusable.
+- The empty `5_90k_140k` income band is a sampling artifact of the 100-row
+  draw (§2.2), kept for future draws.
+- nb7 executes end-to-end via nbconvert (exit 0), including the in-run
+  determinism assertion and the row-identical A/B split assertion.
+
