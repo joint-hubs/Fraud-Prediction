@@ -28,17 +28,22 @@ pytorch-tabnet==4.1.0
 # verified on this machine:
 stat-context==0.4.0
 
-# --- Unpinned: resolve at F3/F4 install time; not yet version-verified ---
+# --- F3: GBDT ensemble + TimesFM (verified on this machine, FOC-175) ---
+lightgbm==4.7.0
+catboost==1.2.10
+# timesfm 3.0.0 is the torch-native backend (no JAX dependency on Windows);
+# imports clean alongside torch 2.11.0+cu128:
+timesfm==3.0.0
+
+# --- Unpinned: resolve at F4 install time; not yet version-verified ---
 plotnine
 graphviz
 dalex
 requests
 beautifulsoup4
-lightgbm
-catboost
-timesfm
 sentence-transformers
 facenet-pytorch
 
-# torch CUDA build — install separately, not from PyPI:
+# torch CUDA build — install separately, not from PyPI (2.11.0+cu128 verified,
+# CUDA available on RTX 5070 Ti, FOC-175):
 # python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
