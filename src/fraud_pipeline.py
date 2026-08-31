@@ -582,13 +582,58 @@ register_arm(
     build_features=_features_timesfm,
     supports_cv=True,
 )
+def _features_sequential(enriched):
+    # nb12 arm input: the per-step factor columns + the sequence keys
+    # (arms_sequential.build_sequence_frame). No label-derived column is ever
+    # included — the step tensors are built from these columns only.
+    import arms_sequential  # lazy: keeps module import light
+
+    return arms_sequential.build_sequence_frame(enriched)
+
+
+def _make_sequential_lstm(y_fit):
+    # F3 nb12 arm (src/arms_sequential.py): per-customer LSTM over transaction
+    # sequences. Lazy sibling import — this module must load without torch
+    # installed (other machines), and a missing dependency surfaces as a
+    # SKIPPED row (ArmSkipped), never a crash.
+    import arms_sequential  # lazy: imports torch only inside fit()
+
+    missing = arms_sequential.check_dependencies()
+    if missing is not None:
+        raise ArmSkipped("sequential-lstm: missing dependency (%s)" % missing)
+    return arms_sequential.make_sequential("lstm", y_fit)
+
+
+def _make_sequential_transformer(y_fit):
+    # F3 nb12 arm (src/arms_sequential.py): a small Transformer encoder over
+    # the SAME per-customer sequences — same protocol, same past-only
+    # discipline, different sequence encoder.
+    import arms_sequential  # lazy: imports torch only inside fit()
+
+    missing = arms_sequential.check_dependencies()
+    if missing is not None:
+        raise ArmSkipped("sequential-transformer: missing dependency (%s)" % missing)
+    return arms_sequential.make_sequential("transformer", y_fit)
+
+
 register_arm(
-    "sequential",
-    "sequence model over per-customer transaction history",
-    make_model=None,
-    build_features=None,
+    "sequential-lstm",
+    "per-customer LSTM over transaction sequences (nb12 arm); past-only scoring "
+    "(own step as query, recurrent state after step i-1 as context), pos_weight "
+    "in BCEWithLogitsLoss — CV off by default ([no-cv])",
+    make_model=_make_sequential_lstm,
+    build_features=_features_sequential,
     supports_cv=False,
-    placeholder=True,
+)
+register_arm(
+    "sequential-transformer",
+    "per-customer Transformer encoder over transaction sequences (nb12 arm); "
+    "causal attention keeping the diagonal (j <= i) — own step as query, "
+    "strictly earlier steps as context; same protocol as sequential-lstm — CV "
+    "off by default ([no-cv])",
+    make_model=_make_sequential_transformer,
+    build_features=_features_sequential,
+    supports_cv=False,
 )
 
 
