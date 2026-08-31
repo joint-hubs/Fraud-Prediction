@@ -537,13 +537,50 @@ register_arm(
     build_features=_features_tabnet,
     supports_cv=False,
 )
+def _features_timesfm(enriched):
+    # nb11 arm input: the xgb-client matrix + the TimesFM forecast-residual
+    # features (arms_timesfm.append_features — per-customer past-only
+    # forecasts, extracted once per process and cached). The dependency probe
+    # happens here too: build_features runs BEFORE make_model in
+    # run_arm_on_split, so a missing timesfm/torch/checkpoint must surface as
+    # a SKIPPED row (ArmSkipped) at this boundary already, never a crash.
+    import arms_timesfm  # lazy: imports timesfm/torch only when the arm runs
+
+    missing = arms_timesfm.check_dependencies()
+    if missing is not None:
+        raise ArmSkipped("timesfm-features: missing dependency (%s)" % missing)
+    enriched = arms_timesfm.append_features(enriched)
+    return pd.concat(
+        [_features_xgb_client(enriched), enriched[arms_timesfm.TIMESFM_FEATURES]],
+        axis=1,
+    )
+
+
+def _make_timesfm(y_fit):
+    # F3 nb11 arm model (src/arms_timesfm.py): the SAME fixed-XGB factory as
+    # xgb-client — the arm's hypothesis is "do the forecast-residual features
+    # add signal", held by keeping the model identical (TimesFM itself is a
+    # forecaster used as a feature extractor, never a classifier). Lazy
+    # sibling import — this module must load without timesfm/torch installed
+    # (other machines); a missing dependency surfaces as a SKIPPED row.
+    import arms_timesfm  # lazy
+
+    missing = arms_timesfm.check_dependencies()
+    if missing is not None:
+        raise ArmSkipped("timesfm-features: missing dependency (%s)" % missing)
+    from xgboost import XGBClassifier  # lazy: keeps module import light
+
+    return XGBClassifier(**xgb_params(y_fit))
+
+
 register_arm(
     "timesfm-features",
-    "TimesFM-encoded amount series appended to base+client features",
-    make_model=None,
-    build_features=None,
-    supports_cv=False,
-    placeholder=True,
+    "base+client features + TimesFM 2.5 forecast-residual features (nb11 arm); "
+    "a forecaster used as a feature extractor — never a classifier. Extraction "
+    "runs once (cached), so CV refits only the XGB",
+    make_model=_make_timesfm,
+    build_features=_features_timesfm,
+    supports_cv=True,
 )
 register_arm(
     "sequential",
