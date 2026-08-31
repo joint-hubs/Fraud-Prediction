@@ -526,10 +526,249 @@ in a 0.009–0.012 band at or below the 0.0132 chance level.
   `joint-hubs/sce`; the workaround is documented in the notebook.
 - `grouped_split` guarantees customer-entry-time ordering, not row-level
   separation — documented in `funs.py`.
+- **stat-context hash-pin unresolved** — a single `--hash=` line activates pip
+  require-hashes mode, which demands a fully-hashed closure including
+  transitive dependencies, and the requirements file's deliberately unpinned
+  F4 block makes that unresolvable without pip-compile-style tooling (full
+  note and the verified wheel sha256: §4.5).
 - **Program reframe (the actionable outcome of this phase):** before any F3
   model work, the evaluation axis that matters is the customer-grouped
   split; every F3/F4 candidate must be judged there, not on the
   chronological split.
 
-<!-- F0-F2 complete; F3 appends §4. -->
+## §4 F3 — unified experiment pipeline & model experiments (FOC-175)
+
+F3 shifts the question from features to model families: does a
+gradient-boosting ensemble, a deep tabular net (TabNet), a pretrained
+time-series forecaster used as a feature extractor (TimesFM), or a
+per-customer sequence model (LSTM / Transformer) add fraud signal beyond the
+F0–F2 arms? All nine arms — the four F0–F2 feature arms plus the four F3
+families (five arms) — are measured by one runner under one protocol on three
+train/test axes. Verdict up front: **no. On the cohort-random
+customer-grouped axis — the PRIMARY axis, per the F2 reviewer recommendation
+(§3.7) — all nine arms are statistically indistinguishable from a random
+ranking; only the chronological axis, which lets customer identity straddle
+train and test, separates arms from chance.** The null result is the finding,
+and the phase's deliverable is the pipeline that makes re-running the
+comparison cheap when more data arrives (§4.4).
+
+### 4.1 Pipeline architecture (`src/fraud_pipeline.py`)
+
+- **One registry, one protocol.** `fraud_pipeline.py` is a unified experiment
+  runner: an arms registry (`ARMS`, populated via `register_arm`) of
+  feature-set × model pairs sharing an sklearn-style `fit` / `predict_proba`
+  interface, and three evaluation axes (`AXES`). Every arm is measured with
+  the nb7/nb8 protocol: one split per axis shared by all arms (identical row
+  indices, re-asserted per axis), a stratified 25% validation carve cut from
+  TRAIN only, an F1-optimal threshold frozen on that carve, and a one-shot
+  frozen-threshold test evaluation reporting PR-AUC, ROC-AUC, F1 and
+  recall@precision — always printed next to the test positive count and the
+  chance level (the test positive rate), because at 11–24 test positives the
+  absolute numbers are unreadable without them. PR-AUC and ROC-AUC carry
+  percentile bootstrap CIs (1000 resamples over test rows); the runner prints
+  an explicit caveat whenever any test set holds ≤ 30 positives — the
+  intervals are wide and indicative only.
+- **Three axes.** `random-grouped` — customers assigned to train/test by a
+  seeded random draw, customer-disjoint, no time ordering — is the PRIMARY
+  axis (customer-disjoint but temporally unbiased); `grouped` (cohort-ordered,
+  latest-seen customers held out) is the stress test that additionally removes
+  recency overlap; `chronological` (the §1/§2 convention) is retained because
+  it is the only axis where the identity signal is in play.
+- **Results accumulate** as JSONL in `results/fraud_pipeline_results.jsonl`
+  (one row per axis × arm; a re-run supersedes its earlier row, so the
+  comparison table always shows the latest measurement per pair). Rows carry
+  no wall-clock fields, so two identical invocations produce byte-identical
+  files.
+- **Determinism.** Seed 42 everywhere; the torch arms re-pin
+  `torch.manual_seed` / `np.random.seed` and `cudnn.deterministic=True`
+  (benchmark off) at every fit. Bit-identical re-runs were observed for every
+  notebook arm: nb9's CPU fits are deterministic by construction; nb10's
+  three identical fits within one kernel produced max probability delta
+  0.000e+00 and a full re-execution reproduced every printed number; nb12's
+  CLI re-invocations matched to the last digit (only wall-clock differed);
+  nb11's feature extraction is bit-identical with the cache bypassed.
+- **Notebook execution** goes through `src/run_notebook.py` — nbclient with
+  the Windows Selector event-loop policy, because the nbconvert CLI kernel
+  start is broken on this machine (§3.1).
+- **Plugging in a new arm takes three steps** (all four F3 families followed
+  exactly this path):
+  1. write `src/arms_<name>.py` exposing an sklearn-style
+     `fit` / `predict_proba` estimator plus `check_dependencies()`, which
+     probe-imports the heavy libraries (and, for TimesFM, the local HF
+     checkpoint) and returns a short message instead of raising when
+     something is missing;
+  2. add a registry entry in `fraud_pipeline.py` with a lazy sibling import —
+     the module must keep loading without torch / pytorch_tabnet / timesfm
+     installed on other machines — plus an optional `build_features(enriched)`
+     and a `supports_cv` flag; a missing dependency surfaces as a SKIPPED
+     result row (`ArmSkipped`), never a crash of the run, and
+     `supports_cv=False` arms are exempt from cross-validation (as is
+     everything under `--no-cv`);
+  3. run `.venv/Scripts/python.exe src/fraud_pipeline.py --run-arm <name>
+     --axis <axis>`; the row lands in the results file and every later
+     comparison table.
+
+### 4.2 Comparison tables
+
+Rows are in registry order; numbers are the accumulated
+`results/fraud_pipeline_results.jsonl` values (the CLI comparison print rounds
+to four decimals). CI is the 95% percentile bootstrap interval on test PR-AUC.
+Recall@precision targets precision 0.50.
+
+Random-grouped axis (PRIMARY; 977 test rows, 13 positives, chance 0.0133):
+
+| Arm | Test PR-AUC | 95% CI | ROC-AUC | F1@frozen | Recall@prec=0.50 | Test positives | Chance level |
+|-----|-------------|--------|---------|-----------|------------------|----------------|--------------|
+| xgb-baseline | 0.0171 | 0.009–0.035 | 0.5622 | 0.0000 | 0.00 | 13 | 0.0133 |
+| xgb-client | 0.0144 | 0.008–0.030 | 0.4844 | 0.0000 | 0.00 | 13 | 0.0133 |
+| dictionary | 0.0231 | 0.012–0.047 | 0.6642 | 0.0000 | 0.00 | 13 | 0.0133 |
+| sce | 0.0134 | 0.008–0.024 | 0.5115 | 0.0000 | 0.00 | 13 | 0.0133 |
+| gbdt-ensemble | 0.0145 | 0.008–0.034 | 0.4941 | 0.0000 | 0.00 | 13 | 0.0133 |
+| tabnet | 0.0138 | 0.008–0.025 | 0.4999 | 0.0000 | 0.00 | 13 | 0.0133 |
+| timesfm-features | 0.0131 | 0.008–0.027 | 0.4686 | 0.0000 | 0.00 | 13 | 0.0133 |
+| sequential-lstm | 0.0167 | 0.009–0.036 | 0.5725 | 0.0000 | 0.00 | 13 | 0.0133 |
+| sequential-transformer | 0.0158 | 0.008–0.040 | 0.4901 | 0.0260 | 0.00 | 13 | 0.0133 |
+
+Grouped axis (stress; 831 test rows, 11 positives, chance 0.0132):
+
+| Arm | Test PR-AUC | 95% CI | ROC-AUC | F1@frozen | Recall@prec=0.50 | Test positives | Chance level |
+|-----|-------------|--------|---------|-----------|------------------|----------------|--------------|
+| xgb-baseline | 0.0101 | 0.005–0.021 | 0.3152 | 0.0000 | 0.00 | 11 | 0.0132 |
+| xgb-client | 0.0091 | 0.005–0.015 | 0.2543 | 0.0000 | 0.00 | 11 | 0.0132 |
+| dictionary | 0.0123 | 0.007–0.028 | 0.4338 | 0.0000 | 0.00 | 11 | 0.0132 |
+| sce | 0.0119 | 0.006–0.025 | 0.3670 | 0.0000 | 0.00 | 11 | 0.0132 |
+| gbdt-ensemble | 0.0094 | 0.005–0.016 | 0.2879 | 0.0000 | 0.00 | 11 | 0.0132 |
+| tabnet | 0.0150 | 0.008–0.027 | 0.5516 | 0.0000 | 0.00 | 11 | 0.0132 |
+| timesfm-features | 0.0133 | 0.007–0.026 | 0.4792 | 0.0000 | 0.00 | 11 | 0.0132 |
+| sequential-lstm | 0.0353 | 0.007–0.193 | 0.4741 | 0.0274 | 0.00 | 11 | 0.0132 |
+| sequential-transformer | 0.0158 | 0.007–0.037 | 0.4930 | 0.0000 | 0.00 | 11 | 0.0132 |
+
+Chronological axis (1061 test rows, 24 positives, chance 0.0226):
+
+| Arm | Test PR-AUC | 95% CI | ROC-AUC | F1@frozen | Recall@prec=0.50 | Test positives | Chance level |
+|-----|-------------|--------|---------|-----------|------------------|----------------|--------------|
+| xgb-baseline | 0.0532 | 0.021–0.161 | 0.6361 | 0.0000 | 0.0417 | 24 | 0.0226 |
+| xgb-client | 0.2374 | 0.085–0.426 | 0.7692 | 0.2667 | 0.2083 | 24 | 0.0226 |
+| dictionary | 0.1034 | 0.040–0.211 | 0.7653 | 0.0769 | 0.0417 | 24 | 0.0226 |
+| sce | 0.0340 | 0.018–0.075 | 0.5542 | 0.0000 | 0.0000 | 24 | 0.0226 |
+| gbdt-ensemble | 0.2409 | 0.088–0.423 | 0.7689 | 0.2581 | 0.2083 | 24 | 0.0226 |
+| tabnet | 0.0245 | 0.013–0.073 | 0.4325 | 0.0526 | 0.0000 | 24 | 0.0226 |
+| timesfm-features | 0.2028 | 0.087–0.379 | 0.7582 | 0.0645 | 0.0417 | 24 | 0.0226 |
+| sequential-lstm | 0.0208 | 0.013–0.041 | 0.4285 | 0.0000 | 0.0000 | 24 | 0.0226 |
+| sequential-transformer | 0.0237 | 0.014–0.042 | 0.4741 | 0.0000 | 0.0000 | 24 | 0.0226 |
+
+Honesty notes on these tables. First, F1 ≈ 0 on the two customer-disjoint
+axes repeats the known frozen-threshold artifact (§1.5.1) — but there it is
+not only a threshold story, since the ranking metrics themselves sit at
+chance. Second, sequential-lstm's grouped 0.0353 is the only customer-disjoint
+point estimate that visibly clears its chance level, and its interval
+(0.007–0.193) is far too wide at 11 positives to read as signal. Third, the
+chronological ordering repeats §2/§3 with the new families folded in:
+xgb-client (0.2374) and gbdt-ensemble (0.2409) lead, timesfm-features
+(0.2028) sits just below them, and the customer-disjoint collapse applies to
+every arm including the new ones.
+
+### 4.3 Per-family notes
+
+- **GBDT ensemble (`gbdt-ensemble`, nb9, `arms_gbdt.py`).** Equal-weight soft
+  vote of XGB + LightGBM + CatBoost on the shared base+client matrix, with
+  per-member rare-class weights from the fitting carve, fixed seeds and
+  single-threaded CPU fits (LightGBM `deterministic=True`, CatBoost
+  `thread_count=1`) — cheap enough (3 × 200 trees) to register with full CV
+  support. **Ensembling hurts on the primary axis**: the best lone member
+  (lgbm) reached test PR-AUC 0.0213 under the identical protocol vs the soft
+  vote's 0.0145 — a delta of −0.0068, well inside the bootstrap band; with
+  correlated members trained on ~4k rows the vote mostly averages
+  near-identical rankings, so the delta is noise-dominated. Implementation
+  note: LightGBM bans JSON special characters in feature names and the
+  `amount_eur_bucket` interval labels carry a comma, so the arm maps feature
+  names through a sanitizer (values, row order and column order unchanged).
+- **TabNet (`tabnet`, nb10, `arms_tabnet.py`).** TabNetClassifier
+  (pytorch-tabnet 4.1.0) on the same 116-column matrix, library-default
+  architecture, CUDA. Two flags travel with the arm: (1) **stalled
+  maintenance** — 4.1.0 is the last release, so any bug or CUDA-compat gap
+  found downstream is unlikely to be fixed upstream; (2) **weak native
+  imbalance handling** — there is no `scale_pos_weight`-style loss weight;
+  the only documented classifier knob is `fit(weights=1)`, an inverse-frequency
+  `WeightedRandomSampler` (library-managed minority oversampling), used here
+  and disclosed — nothing beyond it. Determinism is bit-identical in
+  practice: three identical fits inside one kernel produced max probability
+  delta 0.000e+00, and a full re-execution reproduced every printed number.
+  Attention-mask aggregation over the fitting rows: base categorical ≈ 73%,
+  client categorical ≈ 25%, client numeric ≈ 2% — with the explicit caveat
+  that with null test signal these describe train-side fit, not validated
+  signal (a statement about which memorizable identity features the model
+  leaned on, consistent with the §2/§3 history).
+- **TimesFM (`timesfm-features`, nb11, `arms_timesfm.py`).** TimesFM
+  2.5-200m (torch-native backend, no JAX) is used **strictly as a feature
+  extractor only — a forecaster, not a classifier**. For every transaction
+  the pretrained forecaster predicts the customer's next amount and
+  inter-transaction gap from that customer's strictly earlier transactions
+  (past-only context; labels never enter a forecast), and six
+  residual/quantile/context features are appended to the base+client matrix;
+  the model on top is the SAME fixed XGBClassifier as xgb-client, so the
+  arm's hypothesis is "do the forecast-residual features add signal", held by
+  keeping the model identical. Marginal value ≈ zero: on the primary axis
+  timesfm-features scores 0.0131 vs xgb-client's 0.0144 — no lift; on the
+  chronological axis 0.2028 vs 0.2374 — also no lift. The checkpoint was
+  cached locally (HF snapshot loaded `local_files_only=True`, no network at
+  run time).
+- **Sequential (`sequential-lstm`, `sequential-transformer`, nb12,
+  `arms_sequential.py`).** A 1-layer LSTM (hidden 64) and a 2-layer
+  Transformer encoder (d_model 64) read per-customer transaction sequences
+  (9 embedded factor categoricals + log-scaled amount; no label-derived
+  feature anywhere), scoring a transaction against strictly earlier
+  same-customer steps — shifted recurrent state for the LSTM, causal
+  attention keeping the diagonal for the Transformer — with `pos_weight` in
+  `BCEWithLogitsLoss` as the only imbalance handling. Null on all axes.
+  Sequence shapes: 100 sequences (one per customer), mean 53 steps, max 94;
+  25 customers carry all 91 frauds. The direction, not the score, is the
+  finding: per-customer sequence context — "unusual for THIS customer" — is
+  the genuinely valuable NN direction on this problem, and it is worth
+  re-testing when more data arrives.
+
+### 4.4 Interpretation on the cohort-random axis
+
+- **All nine arms are statistically indistinguishable from chance on the
+  primary axis.** Every arm's 95% PR-AUC interval covers the 0.0133 chance
+  level, and the ROC-AUC point estimates straddle 0.5 (0.4686–0.6642). The
+  dictionary is the only nominal outlier (PR-AUC 0.0231, ROC 0.6642) and even
+  its interval still covers chance. Nothing in §4.2's primary table
+  distinguishes a trained model from a random ranking.
+- **Combined with the chronological lift, this confirms and generalizes the
+  F2 conclusion: the learnable signal at this dataset size is
+  customer-identity memorization, not generalizable fraud pattern.** The
+  chronological axis — the only one where customers straddle train and test —
+  is the only one where arms separate (gbdt-ensemble 0.2409, xgb-client
+  0.2374, timesfm-features 0.2028); on both customer-disjoint axes every arm,
+  old and new, collapses to chance. The CV-vs-test gap reproduces the
+  signature with a new model family: gbdt-ensemble's train-side CV PR-AUC is
+  0.7132 ± 0.109 against a test 0.0145 on the primary axis — three gradient
+  boosting libraries agree on within-customer rankings that transfer to no
+  unseen customer.
+- **Null results are findings, and the pipeline exists precisely so these
+  nine arms can be re-compared cheaply when more data arrives** (the
+  re-scope directive from 2026-08-31): one registry entry per new model, one
+  CLI invocation per arm × axis, and the accumulated results file updates the
+  comparison. Honest expectation-setting for that future comparison: 91
+  frauds total, 11–24 test positives per axis — deltas under ~0.05 PR-AUC
+  between arms are noise at this size (the noise budget the notebooks print),
+  so only a substantially larger labeled set can separate families.
+
+### 4.5 Open items
+
+- **stat-context hash-pin remains unresolved.** A single `--hash=` line on
+  the `stat-context` requirement activates pip's require-hashes mode, which
+  demands a fully-hashed closure including every transitive dependency; the
+  requirements file's deliberately unpinned F4 block ("resolve at F4 install
+  time") makes that unresolvable without pip-compile-style tooling. The
+  verified wheel sha256 is recorded here so the value is not lost:
+  `2749b7b75e3b676bc5c5d03f12dfe950fafff2dea6a66a7ecc7a1f109a10075c`.
+  Decision for the owner.
+- **`fraud_pipeline.py`'s module docstring is stale (cosmetic).** It still
+  describes the F3 arms as reserved placeholders; it was left untouched while
+  the notebook arms landed to minimize churn. A one-line docstring update is
+  a trivial follow-up.
+- **F4 (faces / latent space) is queued AFTER F3** per the 2026-08-31
+  decision — out of F3 scope.
 
