@@ -400,7 +400,15 @@ not transferable fraud detection (§3.6).
   - **(c) base + SCE** — base features plus the 344 cross-fitted context
     statistics; the SCE engine is **refit inside every CV fold** (custom
     sklearn-compatible wrapper; `transform()` for validation/test), so the
-    CV scores are leakage-safe too.
+    CV scores are leakage-safe too. That `transform()` is purely in-memory:
+    the wrapper enriches the frame it is handed through the fold-fitted
+    engine and builds the model matrix from the returned DataFrame — nothing
+    is persisted between calls, and the enrichment is recomputed on every
+    `predict_proba()`/`predict()` invocation (each fold's clone refits its
+    own engine). Out-of-sample rows are scored with the engine's
+    full-fitting-frame statistics — computed from the fitting rows only —
+    and unseen groups back off hierarchically to the global rate rather than
+    erroring (asserted empirically in nb8).
   - **(d) base + dictionary** — nb5-style dictionary scores as features;
     dictionaries and thresholds built on train rows only.
 - **Two splits for every arm:**
@@ -470,8 +478,9 @@ in a 0.009–0.012 band at or below the 0.0132 chance level.
   underperforms even the un-enriched baseline (Δ −0.0192 PR-AUC vs base,
   −0.0695 vs the dictionary arm, as measured in the run).
 - **Why SCE loses here — hypotheses, stated honestly (not established
-  causes):** 344 sparse statistic columns against ~73 positives in the
-  chronological train split; heavy group fragmentation under
+  causes):** 344 sparse statistic columns against 67 positives in the
+  chronological train split (count from the round-1 reviewer cohort control,
+  not from nb8); heavy group fragmentation under
   `min_group_size=5` (172 level-sets on 5.3k rows); the time strategy's NaN
   head (≈17% of fitting rows) backs off to the global mean; fixed XGB
   hyperparameters (nothing was tuned for any arm, by the nb7 discipline);
