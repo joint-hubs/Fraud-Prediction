@@ -331,10 +331,13 @@ not transferable fraud detection (§3.6).
   project `joint-hubs/sce`, Apache-2.0). Installed from PyPI, not from
   GitHub, and no substitute implementation was used — the §1.1 deferral
   ("needs auth") was resolved by the public wheel.
-- nb8 runs on the same environment as §2 (system Python 3.13.7, kernel
-  `fraud-f0`: pandas 2.3.3, scikit-learn 1.7.2, xgboost 2.1.4); no further
-  new dependencies. nb8 is the executed source of every number in this
-  section (commit a7e3dd7).
+- nb8 runs in this phase's fresh worktree venv built from the pinned
+  requirements: CPython 3.11.9, kernel `python3` (pandas 2.3.3,
+  scikit-learn 1.7.2, xgboost 2.1.4, stat-context 0.4.0 — nb8's second cell
+  prints the full resolved set at execution time). Execution is via nbclient
+  with the Windows Selector event-loop policy (the nbconvert CLI kernel
+  start fails on this machine). nb8 is committed WITH its outputs and is
+  the executed source of every number in this section.
 - Target is binary fraud (0/1); the engine computes per-group fraud-rate
   statistics (mean/count aggregations) over declared groupings.
 
@@ -447,16 +450,17 @@ Customer-grouped split (20 held-out customers as test):
 | c: base + SCE | 0.0119 | 0.3670 | 0.0000 | 0.0000 | 0.4532 ± 0.1693 | 431 | +0.0018 |
 | d: base + dictionary | 0.0123 | 0.4338 | 0.0000 | 0.0000 | 0.4786 ± 0.1349 | 94 | +0.0022 |
 
-Honesty note on this table: every test number is at or below the 0.0172
-prevalence — a random ranking lands near prevalence on PR-AUC and at 0.5 on
-ROC-AUC, and all four arms are below both. F1 = 0.0000 across the board is
-again partly the frozen-threshold artifact, but unlike the chronological
-table the PR-AUC/ROC-AUC columns show the ranking itself fails, so this is
-not a threshold story. The CV column is the tell: stratified 5-fold CV mixes
-customers across folds, so within-customer signal survives there (b:
-0.7277) while the customer-disjoint test collapses. At this scale the Δ
-column distinguishes nothing — all arms sit in a 0.009–0.012 band at or
-below the prevalence baseline.
+Honesty note on this table: the grouped test holds 11 positives in 831
+rows (the executed notebook prints the count), so a random ranking lands
+near 11/831 ≈ 0.0132 on PR-AUC and at 0.5 on ROC-AUC — not near the 0.0172
+global prevalence — and all four arms sit below both baselines. F1 = 0.0000
+across the board is again partly the frozen-threshold artifact, but unlike
+the chronological table the PR-AUC/ROC-AUC columns show the ranking itself
+fails, so this is not a threshold story. The CV column is the tell:
+stratified 5-fold CV mixes customers across folds, so within-customer
+signal survives there (b: 0.7277) while the customer-disjoint test
+collapses. At this scale the Δ column distinguishes nothing — all arms sit
+in a 0.009–0.012 band at or below the 0.0132 chance level.
 
 ### 3.6 Interpretation (honest read)
 
@@ -473,13 +477,28 @@ below the prevalence baseline.
   hyperparameters (nothing was tuned for any arm, by the nb7 discipline);
   frozen-threshold artifacts drive F1 to 0 for arms a and c. CV agrees: arm
   c has the lowest CV PR-AUC (0.2214) with the highest variance (±0.1415).
-- **Customer-grouped split: everything collapses.** All four arms land at
-  PR-AUC 0.009–0.012 against a 0.0172 prevalence — i.e. at or below random —
+- **Customer-grouped split: everything collapses.** The grouped test holds
+  11 positives in 831 rows (chance PR-AUC ≈ 0.0132, printed by the executed
+  notebook). All four arms land at PR-AUC 0.009–0.012 — at or below chance —
   and ROC-AUC 0.25–0.44 is below chance. The §2 winner (client features,
   0.2374) collapses hardest (→ 0.0091); the dictionary collapses too
   (0.1034 → 0.0123); SCE is no better (0.0119). **No signal measured in
   F0–F2 survives customer-disjoint evaluation: what looked like fraud
-  detection is identity- and period-memorization.**
+  detection is memorization, not transferable fraud patterns.**
+- **Two distinct mechanisms hide in that collapse — separated (review
+  round-1 control run incorporated).** (i) *Unseen customers alone kill the
+  signal*: on a random customer-cohort split (same protocol, no time shift)
+  arms a/b fall to chance — PR-AUC 0.0171 / 0.0144 against a 0.0133 chance
+  level, ROC-AUC 0.5622 / 0.4844. The features carry no information about
+  customers they were not fit on. (ii) *The later-period shift is a second,
+  separate effect*: only in the time-shifted grouped split do ROC-AUCs drop
+  BELOW 0.5 (0.25–0.44) — a period-cohort reversal (feature–target
+  relationships flip between the 2021 train population and the held-out
+  cohort's period), not a universal anti-signal: the same base features
+  rank at chance (a: ROC 0.5622), not below it, when the cohort is drawn at
+  random. Below-chance ROC is a property of the time-shifted evaluation,
+  and the two mechanisms are reported separately rather than conflated
+  under the unseen-customer label.
 - **Train-side CV makes it explicit.** On the grouped split, CV PR-AUC stays
   high (b: 0.7277, a: 0.6202) while test collapses — the identity signal is
   real within known customers and transfers to no one.
