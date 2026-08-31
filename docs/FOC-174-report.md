@@ -581,12 +581,18 @@ comparison cheap when more data arrives (§4.4).
   files.
 - **Determinism.** Seed 42 everywhere; the torch arms re-pin
   `torch.manual_seed` / `np.random.seed` and `cudnn.deterministic=True`
-  (benchmark off) at every fit. Bit-identical re-runs were observed for every
-  notebook arm: nb9's CPU fits are deterministic by construction; nb10's
-  three identical fits within one kernel produced max probability delta
-  0.000e+00 and a full re-execution reproduced every printed number; nb12's
-  CLI re-invocations matched to the last digit (only wall-clock differed);
-  nb11's feature extraction is bit-identical with the cache bypassed.
+  (benchmark off) at every fit. The runner's metric rows are byte-identical
+  across repeated CLI invocations, and the torch notebooks' within-kernel
+  fit checks were bit-identical: nb10's three identical fits produced max
+  probability delta 0.000e+00 with a full re-execution reproducing every
+  printed number, and nb12's CLI re-invocations matched to the last digit
+  (only wall-clock differed). The one observed exception is nb11: running
+  the TimesFM feature extraction twice within one process gave
+  max |delta feature| = 8.1e+01 (`NONDETERMINISM OBSERVED` in the committed
+  nb11 output) — most plausibly GPU nondeterminism in the TimesFM
+  extraction path. This does not affect the comparison conclusions: every
+  §4.2 table is built from the runner rows (byte-identical as above), and
+  the nb11 arm lands at chance with its CI covering chance by a wide margin.
 - **Notebook execution** goes through `src/run_notebook.py` — nbclient with
   the Windows Selector event-loop policy, because the nbconvert CLI kernel
   start is broken on this machine (§3.1).
