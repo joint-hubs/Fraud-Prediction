@@ -582,17 +582,21 @@ comparison cheap when more data arrives (§4.4).
 - **Determinism.** Seed 42 everywhere; the torch arms re-pin
   `torch.manual_seed` / `np.random.seed` and `cudnn.deterministic=True`
   (benchmark off) at every fit. The runner's metric rows are byte-identical
-  across repeated CLI invocations, and the torch notebooks' within-kernel
-  fit checks were bit-identical: nb10's three identical fits produced max
-  probability delta 0.000e+00 with a full re-execution reproducing every
-  printed number, and nb12's CLI re-invocations matched to the last digit
-  (only wall-clock differed). The one observed exception is nb11: running
-  the TimesFM feature extraction twice within one process gave
-  max |delta feature| = 8.1e+01 (`NONDETERMINISM OBSERVED` in the committed
-  nb11 output) — most plausibly GPU nondeterminism in the TimesFM
-  extraction path. This does not affect the comparison conclusions: every
-  §4.2 table is built from the runner rows (byte-identical as above), and
-  the nb11 arm lands at chance with its CI covering chance by a wide margin.
+  across repeated CLI invocations, and the within-kernel checks were
+  bit-identical across all three torch notebooks: nb10's three identical
+  fits produced max probability delta 0.000e+00 with a full re-execution
+  reproducing every printed number; nb12's CLI re-invocations matched to
+  the last digit (only wall-clock differed); nb11's TimesFM feature
+  extraction re-run in-process is bit-identical once the two extractions
+  are compared with row-identity alignment (max |delta feature| =
+  0.000e+00 in the committed nb11 output). The extractor returns rows in
+  its own stable (customer, timestamp) order, so a positional comparison
+  of the two frames misaligns them; an earlier version of the nb11 check
+  did exactly that and misreported the row-order artifact as GPU
+  nondeterminism — the committed notebook carries the corrected, aligned
+  check. Comparison conclusions are unchanged either way: the nb11 arm
+  lands at chance on the primary (cohort-random) axis, its CI covering
+  chance (§4.2).
 - **Notebook execution** goes through `src/run_notebook.py` — nbclient with
   the Windows Selector event-loop policy, because the nbconvert CLI kernel
   start is broken on this machine (§3.1).

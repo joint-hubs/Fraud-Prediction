@@ -61,8 +61,11 @@ and the 5 CV folds, reuses it.
 
 Determinism: fixed seed, eval-mode inference (no dropout, no RNG), fixed batch
 composition (stable sort + the API's own padding) — two extractions produce
-bit-identical features (verified in nb11). torch_compile is left OFF: it would
-add ~minutes of warm-up on this stack for no accuracy gain.
+bit-identical features (verified in nb11 by a row-identity-aligned
+re-extraction check; this extractor returns rows in its own stable
+(customer, timestamp) order, so a positional comparison of two runs
+misaligns them and reports a bogus delta). torch_compile is left OFF: it
+would add ~minutes of warm-up on this stack for no accuracy gain.
 
 Checkpoint discipline: the `google/timesfm-2.5-200m-pytorch` snapshot is fully
 cached locally; it is loaded with local_files_only=True end to end
