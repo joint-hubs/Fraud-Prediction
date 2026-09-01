@@ -915,3 +915,183 @@ chronological axis (identity-straddling; 1061 test rows, 24 positives, chance 0.
   one-time generation — noted so a future re-generation does not read the warnings as errors.
 - The §4.5 docstring-staleness item is resolved in F4 (module docstring now lists all 13
   wired arms); the stat-context hash-pin decision remains open for the owner.
+
+## §6 F5 — threshold / statistical layer over the latent space (FOC-179)
+
+### 6.1 Environment
+
+Same pinned stack as F4 (no new dependency — the scorers use numpy/sklearn only, both already
+pinned); executed on a fresh venv at `C:/venv-f5` (Python 3.11.9, torch 2.11.0+cu128, sklearn
+1.7.2, pandas 2.3.3, pyarrow 21.0.0 — `pip check` clean, all `requirements.txt` pins satisfied).
+Notebook `src/16. Latent Thresholds.ipynb` runs end-to-end via `src/run_notebook.py` (nbclient +
+`WindowsSelectorEventLoopPolicy`) in ~3.5 min, exit 0, committed with outputs.
+
+### 6.2 Method — the dictionary model's threshold logic, ported
+
+nb4's dictionary model scores every transaction by aggregating per-variable fraud probabilities
+and **calibrates its thresholds on the training rows only** (a 3-threshold F1 grid over the fit
+rows; `DictionaryRateEnricher` mirrors it inside `fit()` in the runner). F5 applies the same
+calibration story to the fused 128-d-per-block latent space (face 512 + text 384 + demo 384,
+per-modality L2-normalized, stateless concat). Five anomaly scorers + one light classifier
+(Mateusz's F5 decision of 2026-09-01, closing the issue's "decide later"), all registered in the
+runner as ordinary arms over the **pure latent frame** (the 1280 embedding dims alone — the
+geometry-based methods read latent geometry, not the one-hot re-encodings the F4 fusion arm
+appends; nb15's `latent-pure` ablation uses the same frame):
+
+| Arm | Score (higher = more anomalous) | Reference fitted on | Dictionary-model analogue |
+|---|---|---|---|
+| `latent-nn-dist` | distance to the 5th-nearest legitimate fitting row (self-matches excluded for calibration) | legit fit carve | per-row "exceeds cutoff" flags |
+| `latent-centroid-dist` | Euclidean distance to the legitimate centroid | legit fit carve | distance thresholds |
+| `latent-cosine-centroid` | angular score `1 − cos` to the legitimate mean direction | legit fit carve | angle thresholds (blocks are L2-normalized — the angle is the geometry) |
+| `latent-cluster-anom` | distance to the nearest k-means center (k=8) | legit fit carve, TRAIN ONLY | anomaly within clusters |
+| `latent-gmm-density` | negative log likelihood under PCA(64) + diagonal GMM | legit fit carve, TRAIN ONLY | distributional thresholds |
+| `latent-logistic` | supervised logistic-regression probability (C=1, lbfgs) | full fit carve | the "train models too" option, decided 2026-09-01 |
+
+Leakage discipline (the FOC-179 hard requirement): every fitted object — neighbor index, centroid,
+k-means, PCA, GMM, logistic weights — is fitted inside the estimator's `fit()` on the rows the
+runner hands it (the stratified fit carve of the training side). No clustering or density model
+ever sees test rows, and nothing is fitted in `build_features` (which runs pre-split). Each scorer
+additionally calibrates its own train-percentile operating point (`q99` of the legitimate fit-row
+scores) inside `fit()` — the latent analogue of the dictionary's train-only threshold grid.
+
+**Runner integration (no protocol extension was needed):** the scorers wrap into ordinary
+sklearn-style estimators (`src/arms_latent.py`, following the `DictionaryRateEnricher` precedent)
+that expose the raw anomaly score as `predict_proba(X)[:, 1]`. PR-AUC/ROC-AUC are rank-based, so
+the raw score is directly comparable, and the runner keeps freezing its own best-F1 threshold on
+the validation carve — every F5 arm is measured through the *identical* protocol as the 13
+F0–F4 arms, on all three axes, with percentile-bootstrap CIs. The one schema-visible difference
+is `n_features=1280` (the pure latent frame). Nothing was hand-rolled outside `funs.py`/
+`fraud_pipeline.py`.
+
+### 6.3 Comparison tables (F5 arms + anchors × 3 axes, runner protocol)
+
+Anchors: `dictionary` (the conceptual ancestor whose threshold logic F5 ports), `xgb-baseline`,
+`latent-fusion` (XGB over the same latent space, from F4). Rows come from the accumulated runner
+results (`results/fraud_pipeline_results.jsonl`, 57 rows after F5's 18).
+
+random-grouped axis (PRIMARY; 977 test rows, 13 positives, chance 0.0133):
+
+| Arm | Test PR-AUC | 95% CI | ROC-AUC | F1@frozen | Recall@prec=0.50 | CV PR-AUC (mean±std) | Test positives | Chance level |
+|---|---|---|---|---|---|---|---|---|
+| dictionary | 0.0231 | 0.0122–0.0469 | 0.6642 | 0.0000 | 0.0000 | 0.5071±0.1027 | 13 | 0.0133 |
+| xgb-baseline | 0.0171 | 0.0093–0.0350 | 0.5622 | 0.0000 | 0.0000 | 0.5316±0.1130 | 13 | 0.0133 |
+| latent-fusion | 0.0174 | 0.0084–0.0503 | 0.5348 | 0.0000 | 0.0000 | 0.6033±0.0924 | 13 | 0.0133 |
+| latent-nn-dist | 0.0142 | 0.0076–0.0312 | 0.4891 | 0.0263 | 0.0000 | 0.0310±0.0089 | 13 | 0.0133 |
+| latent-centroid-dist | 0.0194 | 0.0110–0.0366 | 0.6524 | 0.0312 | 0.0000 | 0.0171±0.0047 | 13 | 0.0133 |
+| latent-cosine-centroid | 0.0194 | 0.0110–0.0366 | 0.6524 | 0.0312 | 0.0000 | 0.0171±0.0047 | 13 | 0.0133 |
+| latent-cluster-anom | 0.0153 | 0.0086–0.0288 | 0.5531 | 0.0263 | 0.0000 | 0.0170±0.0037 | 13 | 0.0133 |
+| latent-gmm-density | 0.0229 | 0.0134–0.0439 | 0.7033 | 0.0263 | 0.0000 | 0.0186±0.0034 | 13 | 0.0133 |
+| latent-logistic | 0.0224 | 0.0094–0.0742 | 0.5653 | 0.0000 | 0.0000 | 0.3207±0.1118 | 13 | 0.0133 |
+
+grouped axis (stress; 831 test rows, 11 positives, chance 0.0132):
+
+| Arm | Test PR-AUC | 95% CI | ROC-AUC | F1@frozen | Recall@prec=0.50 | CV PR-AUC (mean±std) | Test positives | Chance level |
+|---|---|---|---|---|---|---|---|---|
+| dictionary | 0.0123 | 0.0065–0.0280 | 0.4338 | 0.0000 | 0.0000 | 0.4786±0.1349 | 11 | 0.0132 |
+| xgb-baseline | 0.0101 | 0.0054–0.0214 | 0.3152 | 0.0000 | 0.0000 | 0.6202±0.0959 | 11 | 0.0132 |
+| latent-fusion | 0.0194 | 0.0097–0.0480 | 0.6157 | 0.0000 | 0.0000 | 0.5943±0.0859 | 11 | 0.0132 |
+| latent-nn-dist | 0.0227 | 0.0099–0.0477 | 0.6252 | 0.0261 | 0.0000 | 0.0839±0.0532 | 11 | 0.0132 |
+| latent-centroid-dist | 0.0124 | 0.0064–0.0218 | 0.4563 | 0.0000 | 0.0000 | 0.0290±0.0283 | 11 | 0.0132 |
+| latent-cosine-centroid | 0.0124 | 0.0064–0.0218 | 0.4563 | 0.0000 | 0.0000 | 0.0290±0.0283 | 11 | 0.0132 |
+| latent-cluster-anom | 0.0171 | 0.0084–0.0342 | 0.5865 | 0.0000 | 0.0000 | 0.0247±0.0148 | 11 | 0.0132 |
+| latent-gmm-density | 0.0168 | 0.0081–0.0383 | 0.5469 | 0.0000 | 0.0000 | 0.0638±0.0532 | 11 | 0.0132 |
+| latent-logistic | 0.0131 | 0.0061–0.0345 | 0.3940 | 0.0000 | 0.0000 | 0.3089±0.0873 | 11 | 0.0132 |
+
+chronological axis (identity-straddling; 1061 test rows, 24 positives, chance 0.0226):
+
+| Arm | Test PR-AUC | 95% CI | ROC-AUC | F1@frozen | Recall@prec=0.50 | CV PR-AUC (mean±std) | Test positives | Chance level |
+|---|---|---|---|---|---|---|---|---|
+| dictionary | 0.1034 | 0.0404–0.2113 | 0.7653 | 0.0769 | 0.0417 | 0.3539±0.0814 | 24 | 0.0226 |
+| xgb-baseline | 0.0532 | 0.0214–0.1610 | 0.6361 | 0.0000 | 0.0417 | 0.4633±0.0660 | 24 | 0.0226 |
+| latent-fusion | 0.1260 | 0.0383–0.2739 | 0.7191 | 0.1333 | 0.0417 | 0.4738±0.0671 | 24 | 0.0226 |
+| latent-nn-dist | 0.2369 | 0.0859–0.4183 | 0.7356 | 0.0492 | 0.2083 | 0.0235±0.0096 | 24 | 0.0226 |
+| latent-centroid-dist | 0.0281 | 0.0171–0.0478 | 0.5873 | 0.0000 | 0.0000 | 0.0160±0.0070 | 24 | 0.0226 |
+| latent-cosine-centroid | 0.0281 | 0.0171–0.0478 | 0.5873 | 0.0000 | 0.0000 | 0.0160±0.0070 | 24 | 0.0226 |
+| latent-cluster-anom | 0.0229 | 0.0141–0.0396 | 0.4939 | 0.0503 | 0.0000 | 0.0170±0.0050 | 24 | 0.0226 |
+| latent-gmm-density | 0.0426 | 0.0220–0.0904 | 0.6201 | 0.0529 | 0.0000 | 0.0221±0.0157 | 24 | 0.0226 |
+| latent-logistic | 0.0651 | 0.0150–0.1688 | 0.4662 | 0.0800 | 0.0417 | 0.3713±0.0628 | 24 | 0.0226 |
+
+### 6.4 Calibration study — the scorers' own train-percentile operating points
+
+The runner's frozen threshold makes the arms comparable; the scorers' own story — the dictionary
+model's — is a threshold calibrated on train and applied frozen to test. Refitting each anomaly
+scorer on the PRIMARY fit carve (3243 rows, 3185 legit) exactly as the runner does, with the
+legitimate-score q95/q99 as the operating point (nb16, 13 test positives, chance 0.0133 —
+descriptive, not inferential):
+
+| Arm | Percentile | Threshold | Flagged (of 977) | Precision | Recall |
+|---|---|---|---|---|---|
+| latent-nn-dist | q95 | 0.7763 | 977 | 0.0133 | 1.0000 |
+| latent-centroid-dist | q95 | 1.2928 | 112 | 0.0000 | 0.0000 |
+| latent-cosine-centroid | q95 | 0.3320 | 112 | 0.0000 | 0.0000 |
+| latent-cluster-anom | q95 | 1.2107 | 401 | 0.0175 | 0.5385 |
+| latent-gmm-density | q95 | −36.6767 | 427 | 0.0281 | 0.9231 |
+| latent-nn-dist | q99 | 0.8481 | 977 | 0.0133 | 1.0000 |
+| latent-centroid-dist | q99 | 1.3436 | 18 | 0.0000 | 0.0000 |
+| latent-cosine-centroid | q99 | 0.3628 | 18 | 0.0000 | 0.0000 |
+| latent-cluster-anom | q99 | 1.2620 | 228 | 0.0132 | 0.2308 |
+| latent-gmm-density | q99 | −29.9726 | 196 | 0.0204 | 0.3077 |
+
+The `latent-nn-dist` rows are degenerate and instructive: **every** test row lands above the q99
+calibration point. On the customer-grouped axes the fit rows have their own customer's other
+transactions as near-duplicate neighbors, while held-out test customers have no representative in
+the reference set at all — so the k-NN distance measures *customer novelty*, not fraud. That is
+the customer-disjoint discipline doing its job, and it is why the arm's PR-AUC sits at chance
+despite flagging everything: the score carries no fraud information that transfers across
+customers. The GMM's q95 point (precision 0.0281, recall 0.9231) is the only operating point that
+beats chance precision at meaningful recall — read with §6.5's caveat below.
+
+### 6.5 Determinism
+
+- **Identity-aligned feature check (F3 r3 discipline):** two `_features_latent_pure` builds of the
+  full frame asserted index-equal BEFORE diffing — max |delta| = 0.0 over 5302 × 1280 (nb16).
+  No positional comparison anywhere.
+- **Re-run equality:** `latent-cluster-anom` on PRIMARY run twice through the runner — 19 result
+  fields byte-identical. All randomized components carry fixed seeds (repo `RANDOM_STATE = 42`:
+  k-means `n_init=10`, PCA randomized SVD, GMM init); the JSONL carries no wall-clock fields.
+- Notebook vs CLI agreement: the nb16-measured F5 rows match the canonical CLI rows (same
+  protocol, same seeds) — e.g. `latent-gmm-density` PRIMARY 0.0229 [0.0134–0.0439] in both.
+
+### 6.6 Interpretation (honest read)
+
+- **The pre-registered null holds on PRIMARY — with one razor-thin exception that should be read
+  as noise.** Seven of the nine F5-family rows cover chance. The exception,
+  `latent-gmm-density` (0.0229, CI 0.0134–0.0439 vs chance 0.013306), separates by 7×10⁻⁵ on the
+  lower CI bound — a boundary at the fourth decimal of a 1000-resample percentile bootstrap with
+  13 positives, in a table of 54 axis×arm comparisons. One arm scraping past at that margin is
+  exactly what noise does under multiplicity; the honest verdict is "indistinguishable from
+  chance, formally marginal." Its ROC-AUC (0.7033, CI 0.6115–0.7890) shows the rare-class pattern:
+  ranking mostly-correct among ~964 negatives inflates ROC while average precision stays at the
+  chance floor — PR-AUC is the decision metric here (§1.2/§6 DoD).
+- **A threshold layer cannot exceed its input representation.** This was the pre-registered F5
+  expectation and it is confirmed: the latent space itself carries ~no customer-transferable fraud
+  signal at 5.3k transactions (F4), so distances, angles, clusters and densities over that space
+  cannot manufacture one. The dictionary model remains the best PRIMARY arm overall (0.0231) —
+  and its tabular per-variable lookup logic still beats its own latent-space port.
+- **The chronological "lifts" are the known identity/novelty artifacts, in two flavours.**
+  `latent-nn-dist` posts 0.2369 — the largest chronological number of the whole study — while its
+  CV PR-AUC is 0.0235 (≈ chance): test rows are scored against a reference that contains their own
+  customers' rows (the axis straddles identity), so the score partly measures known-customer
+  proximity, the same mechanism F4 documented for `face-features` (0.2617). `latent-logistic`
+  shows the mirror image: CV 0.3713 (in-sample customers memorizable from the embedding constants)
+  vs test 0.0651 with a CI (0.0150–0.1688) that covers chance — the supervised read of the same
+  non-transferable signal. On the honest, customer-disjoint axes nothing separates.
+- **The calibration study adds the operational caution:** a train-percentile threshold on these
+  scores flags 1–45% of test traffic at chance-level precision (`latent-nn-dist` flags 100%).
+  Threshold methods calibrated on a customer-disjoint reference need more data — or a
+  customer-representative reference — before their operating points mean anything here.
+- **What F5 delivers** is the machinery: six deterministic, cached, cheaply re-runnable arms
+  (`python src/fraud_pipeline.py --run-arm <arm> --axis <axis>`, ~5–40 s each) implementing the
+  dictionary model's calibration story over the latent space inside the one runner protocol —
+  ready for the day the dataset outgrows the null.
+
+### 6.7 F5 open items
+
+- The bootstrap-CI multiplicity point above (one marginal "separation" among 54 comparisons) is
+  reported, not corrected for — no multiple-comparison machinery was added, consistent with the
+  indicative role the CIs were given in §1.
+- `cross_validate_model` is row-stratified, not customer-grouped: CV PR-AUC therefore overstates
+  transfer on every arm whose features encode customer identity (all embedding arms; §4/§5 note
+  the same). A grouped-CV variant is a natural follow-up, deliberately NOT built in F5.
+- No new dependency was introduced; nothing to pin. `arms_latent.py` uses numpy + sklearn only.
+- Scope boundary respected: SEC (FOC-181), merge to main, push — all out of F5.
