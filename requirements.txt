@@ -35,14 +35,24 @@ catboost==1.2.10
 # imports clean alongside torch 2.11.0+cu128:
 timesfm==3.0.0
 
-# --- Unpinned: resolve at F4 install time; not yet version-verified ---
+# --- F4: multi-modal embeddings (verified on this machine, FOC-178) ---
+# pyarrow is a stat-context transitive dep; 25.x DLLs are blocked by Windows
+# Smart App Control on this machine — 21.0.0 imports clean:
+pyarrow==21.0.0
+# facenet-pytorch MUST be installed with --no-deps BEFORE the cu128 torch trio
+# (it would otherwise drag torchvision 0.28 forcing torch==2.13.0+cpu from
+# PyPI and silently swap out the cu128 build — verify torch.__version__ +
+# torch.cuda.is_available() after every install batch):
+facenet-pytorch==2.5.3
+sentence-transformers==6.0.1
+transformers==5.16.1
+
+# --- Unpinned: not used by any F0-F4 notebook; resolve when needed ---
 plotnine
 graphviz
 dalex
 requests
 beautifulsoup4
-sentence-transformers
-facenet-pytorch
 
 # torch CUDA build — install separately, not from PyPI (2.11.0+cu128 verified,
 # CUDA available on RTX 5070 Ti, FOC-175):

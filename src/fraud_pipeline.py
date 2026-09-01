@@ -1,4 +1,4 @@
-"""Unified experiment pipeline for the fraud R&D arms (FOC-175).
+"""Unified experiment pipeline for the fraud R&D arms (FOC-175, FOC-178).
 
 One registry of arms (feature-set x model pairs sharing an sklearn-style
 fit/predict_proba interface) evaluated on three train/test axes under the
@@ -9,12 +9,14 @@ recall@target-precision) reported next to the test positive count and the
 chance level (test positive rate). Test PR-AUC/ROC-AUC carry percentile
 bootstrap intervals — honest-but-cheap uncertainty at 11-24 test positives.
 
-Wired arms (lifted from nb7/nb8, see the per-arm comments): xgb-baseline,
-xgb-client, dictionary, sce. The F3 notebook arms (gbdt-ensemble, tabnet,
-timesfm-features, sequential) are reserved as placeholders — running one
-reports a SKIPPED row with the reason, never a crash of the whole run. Heavy
-dependencies (xgboost, sce, torch, tabnet, timesfm) are imported lazily inside
-the arm factories so this module loads without any of them installed.
+Wired arms (lifted from nb7-nb15, see the per-arm comments): xgb-baseline,
+xgb-client, dictionary, sce (F0-F2); gbdt-ensemble, tabnet, timesfm-features,
+sequential-lstm, sequential-transformer (F3); face-features,
+text-features-minilm-l6, demo-features, latent-fusion (F4 embeddings). Heavy
+dependencies (xgboost, sce, torch, tabnet, timesfm, facenet-pytorch,
+sentence-transformers) are imported lazily inside the arm factories so this
+module loads without any of them installed; a missing dependency surfaces as a
+SKIPPED row, never a crash of the whole run.
 
 Results accumulate as JSONL under results/ (one row per axis x arm; a re-run
 supersedes its earlier row so the table always shows the latest measurement
@@ -634,6 +636,183 @@ register_arm(
     make_model=_make_sequential_transformer,
     build_features=_features_sequential,
     supports_cv=False,
+)
+
+
+# --- F4 embedding arms (nb13/nb14/nb15) --------------------------------------
+# Every arm = the SAME fixed-XGB factory as xgb-client + one embedding block
+# appended to the xgb-client matrix, so any PR-AUC delta is attributable to
+# the embedding features alone. Extraction is label-free, cached and
+# fold-independent (the timesfm precedent), so CV refits only the XGB.
+
+def _features_face(enriched):
+    # nb13 arm input: the xgb-client matrix + the per-customer StyleGAN2 ->
+    # FaceNet 512-d face embedding (arms_face.append_features — generated once
+    # per customer, cached in data/faces/ + data/face_embeddings.npz). The
+    # dependency probe happens here: build_features runs BEFORE make_model in
+    # run_arm_on_split, so a missing dep must surface as a SKIPPED row
+    # (ArmSkipped) at this boundary already, never a crash.
+    import arms_face  # lazy: imports torch/facenet only when the arm runs
+
+    missing = arms_face.check_dependencies()
+    if missing is not None:
+        raise ArmSkipped("face-features: missing dependency (%s)" % missing)
+    with_face = arms_face.append_features(enriched)
+    return pd.concat(
+        [_features_xgb_client(with_face), with_face[arms_face.FACE_FEATURES]],
+        axis=1,
+    )
+
+
+def _make_face(y_fit):
+    # F4 nb13 arm model (src/arms_face.py): the SAME fixed-XGB factory as
+    # xgb-client — the arm's hypothesis is "does the face-embedding block add
+    # signal", held by keeping the model identical (the encoder is a feature
+    # extractor, never a classifier). Lazy sibling import.
+    import arms_face  # lazy
+
+    missing = arms_face.check_dependencies()
+    if missing is not None:
+        raise ArmSkipped("face-features: missing dependency (%s)" % missing)
+    from xgboost import XGBClassifier  # lazy: keeps module import light
+
+    return XGBClassifier(**xgb_params(y_fit))
+
+
+register_arm(
+    "face-features",
+    "base+client features + per-customer StyleGAN2->FaceNet 512-d face "
+    "embeddings (nb13 arm, FOC-178 D5); appearance carries a PRE-REGISTERED "
+    "no-signal expectation — the block is a customer-identity proxy experiment "
+    "with an ethical caveat (nb13); extraction cached, CV refits only the XGB",
+    make_model=_make_face,
+    build_features=_features_face,
+    supports_cv=True,
+)
+
+
+def _features_text(enriched):
+    # nb14 arm input: the xgb-client matrix + synthesized-transaction-text
+    # MiniLM-L6 embeddings (the nb14-chosen candidate: within the 0.05 noise
+    # budget on the PRIMARY axis, the cheaper encoder wins). D4 experimental:
+    # the text is DETERMINISTICALLY SYNTHESIZED from existing tabular fields,
+    # so the block largely re-encodes known signal (arms_text docstring).
+    import arms_text  # lazy: imports sentence-transformers only when the arm runs
+
+    missing = arms_text.check_dependencies()
+    if missing is not None:
+        raise ArmSkipped("text-features-minilm-l6: missing dependency (%s)" % missing)
+    with_text = arms_text.append_features(enriched, model_name=arms_text.DEFAULT_MODEL)
+    return pd.concat(
+        [_features_xgb_client(with_text), with_text[arms_text.text_feature_columns()]],
+        axis=1,
+    )
+
+
+def _make_text(y_fit):
+    # F4 nb14 arm model (src/arms_text.py): same fixed-XGB factory, same
+    # hold-the-model-constant discipline as face-features.
+    import arms_text  # lazy
+
+    missing = arms_text.check_dependencies()
+    if missing is not None:
+        raise ArmSkipped("text-features-minilm-l6: missing dependency (%s)" % missing)
+    from xgboost import XGBClassifier  # lazy: keeps module import light
+
+    return XGBClassifier(**xgb_params(y_fit))
+
+
+register_arm(
+    "text-features-minilm-l6",
+    "base+client features + synthesized-transaction-text MiniLM-L6 384-d "
+    "embeddings (nb14 arm, D4 experimental — no real text column exists); the "
+    "synthetic text re-encodes tabular signal, extraction cached, CV refits "
+    "only the XGB",
+    make_model=_make_text,
+    build_features=_features_text,
+    supports_cv=True,
+)
+
+
+def _features_demo(enriched):
+    # nb15 arm input: the xgb-client matrix + per-customer demographic profile
+    # embeddings (arms_demo.append_features — dim_customer profile text ->
+    # MiniLM-L6, cached in data/demo_embeddings.npz behind a corpus digest).
+    import arms_demo  # lazy sibling
+
+    missing = arms_demo.check_dependencies()
+    if missing is not None:
+        raise ArmSkipped("demo-features: missing dependency (%s)" % missing)
+    with_demo = arms_demo.append_features(enriched)
+    return pd.concat(
+        [_features_xgb_client(with_demo), with_demo[arms_demo.demo_feature_columns()]],
+        axis=1,
+    )
+
+
+def _make_demo(y_fit):
+    # F4 nb15 arm model (src/arms_demo.py): same fixed-XGB factory discipline.
+    import arms_demo  # lazy
+
+    missing = arms_demo.check_dependencies()
+    if missing is not None:
+        raise ArmSkipped("demo-features: missing dependency (%s)" % missing)
+    from xgboost import XGBClassifier  # lazy: keeps module import light
+
+    return XGBClassifier(**xgb_params(y_fit))
+
+
+register_arm(
+    "demo-features",
+    "base+client features + per-customer demographic profile embeddings (nb15 "
+    "arm; MiniLM over the dim_customer profile text) — a dense re-encoding of "
+    "fields xgb-client already one-hots; extraction cached, CV refits only the XGB",
+    make_model=_make_demo,
+    build_features=_features_demo,
+    supports_cv=True,
+)
+
+
+def _features_fusion(enriched):
+    # nb15 arm input: the fused latent space — L2-normalized face(512) +
+    # text(384) + demo(384) blocks concatenated STATELESSLY on the xgb-client
+    # matrix. No fitted projection/alignment: anything fit inside
+    # build_features runs on the full pre-split frame and would leak, and 100
+    # customers cannot fit a shared space (the full argument lives in the
+    # arms_fusion docstring and nb15's fusion-choice cell).
+    import arms_fusion  # lazy sibling
+
+    missing = arms_fusion.check_dependencies()
+    if missing is not None:
+        raise ArmSkipped("latent-fusion: missing dependency (%s)" % missing)
+    fused = arms_fusion.append_features(enriched)
+    return pd.concat(
+        [_features_xgb_client(fused), fused[arms_fusion.FUSED_FEATURES]],
+        axis=1,
+    )
+
+
+def _make_fusion(y_fit):
+    # F4 nb15 arm model (src/arms_fusion.py): same fixed-XGB factory discipline.
+    import arms_fusion  # lazy
+
+    missing = arms_fusion.check_dependencies()
+    if missing is not None:
+        raise ArmSkipped("latent-fusion: missing dependency (%s)" % missing)
+    from xgboost import XGBClassifier  # lazy: keeps module import light
+
+    return XGBClassifier(**xgb_params(y_fit))
+
+
+register_arm(
+    "latent-fusion",
+    "the fused latent space: L2-normalized face(512)+text(384)+demo(384) blocks "
+    "concatenated statelessly on base+client features (nb15 arm); no fitted "
+    "projection — a pre-split fit would leak and 100 customers cannot fit a "
+    "shared space; extraction cached, CV refits only the XGB",
+    make_model=_make_fusion,
+    build_features=_features_fusion,
+    supports_cv=True,
 )
 
 
