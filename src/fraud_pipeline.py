@@ -12,7 +12,10 @@ bootstrap intervals — honest-but-cheap uncertainty at 11-24 test positives.
 Wired arms (lifted from nb7-nb15, see the per-arm comments): xgb-baseline,
 xgb-client, dictionary, sce (F0-F2); gbdt-ensemble, tabnet, timesfm-features,
 sequential-lstm, sequential-transformer (F3); face-features,
-text-features-minilm-l6, demo-features, latent-fusion (F4 embeddings). Heavy
+text-features-minilm-l6, demo-features, latent-fusion (F4 embeddings);
+latent-nn-dist, latent-centroid-dist, latent-cosine-centroid,
+latent-cluster-anom, latent-gmm-density, latent-logistic (F5 threshold /
+statistical layer over the fused latent space, scorers in arms_latent). Heavy
 dependencies (xgboost, sce, torch, tabnet, timesfm, facenet-pytorch,
 sentence-transformers) are imported lazily inside the arm factories so this
 module loads without any of them installed; a missing dependency surfaces as a
@@ -812,6 +815,121 @@ register_arm(
     "shared space; extraction cached, CV refits only the XGB",
     make_model=_make_fusion,
     build_features=_features_fusion,
+    supports_cv=True,
+)
+
+
+# ---------------------------------------------------------------------------
+# F5 — threshold / statistical layer over the latent space (FOC-179). The
+# dictionary model's threshold logic ported to the fused 1280-d embedding:
+# each arm scores the PURE latent space (the 1280 embedding dims alone — the
+# geometry-based methods need the latent geometry, not the one-hot re-encodings
+# the fusion arm appends) and calibrates its threshold on the fitting rows
+# only, inside fit(). The runner's own frozen threshold drives the comparison
+# metrics; the arms' train-percentile operating points are the nb16
+# calibration study. Feature frame shared by all six arms.
+def _features_latent_pure(enriched):
+    import arms_fusion  # lazy sibling
+
+    missing = arms_fusion.check_dependencies()
+    if missing is not None:
+        raise ArmSkipped("latent threshold arms: missing dependency (%s)" % missing)
+    fused = arms_fusion.append_features(enriched)
+    return fused.loc[:, arms_fusion.FUSED_FEATURES]
+
+
+def _make_latent_nn_dist(y_fit):
+    import arms_latent  # lazy sibling
+
+    return arms_latent.NearestLegitScorer(n_neighbors=5, percentile=99.0)
+
+
+def _make_latent_centroid(y_fit):
+    import arms_latent  # lazy sibling
+
+    return arms_latent.CentroidScorer(percentile=99.0)
+
+
+def _make_latent_cosine(y_fit):
+    import arms_latent  # lazy sibling
+
+    return arms_latent.CosineCentroidScorer(percentile=99.0)
+
+
+def _make_latent_cluster(y_fit):
+    import arms_latent  # lazy sibling
+
+    return arms_latent.ClusterAnomalyScorer(n_clusters=8, percentile=99.0)
+
+
+def _make_latent_gmm(y_fit):
+    import arms_latent  # lazy sibling
+
+    return arms_latent.GMMDensityScorer(n_pca=64, n_components=4, percentile=99.0)
+
+
+def _make_latent_logistic(y_fit):
+    import arms_latent  # lazy sibling
+
+    return arms_latent.LatentLogisticClassifier(C=1.0, max_iter=1000)
+
+
+register_arm(
+    "latent-nn-dist",
+    "F5: distance to the 5th-nearest LEGITIMATE fitting row in the fused "
+    "1280-d space (self-matches excluded for calibration); percentile "
+    "threshold calibrated on legit fitting rows inside fit()",
+    make_model=_make_latent_nn_dist,
+    build_features=_features_latent_pure,
+    supports_cv=True,
+)
+
+register_arm(
+    "latent-centroid-dist",
+    "F5: Euclidean distance to the legitimate fitting centroid in the fused "
+    "1280-d space; percentile threshold calibrated on legit fitting rows",
+    make_model=_make_latent_centroid,
+    build_features=_features_latent_pure,
+    supports_cv=True,
+)
+
+register_arm(
+    "latent-cosine-centroid",
+    "F5: angular score 1-cosine to the legitimate mean direction (the fused "
+    "blocks are per-modality L2-normalized, so the angle is the geometry); "
+    "percentile threshold calibrated on legit fitting rows",
+    make_model=_make_latent_cosine,
+    build_features=_features_latent_pure,
+    supports_cv=True,
+)
+
+register_arm(
+    "latent-cluster-anom",
+    "F5: within-cluster anomaly — k-means (k=8) fitted on the LEGITIMATE "
+    "fitting rows only, score = distance to the nearest center; leakage "
+    "discipline per FOC-179 (no clustering over the full dataset)",
+    make_model=_make_latent_cluster,
+    build_features=_features_latent_pure,
+    supports_cv=True,
+)
+
+register_arm(
+    "latent-gmm-density",
+    "F5: distributional threshold — PCA(64)+diagonal GMM fitted on the "
+    "LEGITIMATE fitting rows only, score = negative log likelihood (the "
+    "dictionary model's distributional calibration, ported to density)",
+    make_model=_make_latent_gmm,
+    build_features=_features_latent_pure,
+    supports_cv=True,
+)
+
+register_arm(
+    "latent-logistic",
+    "F5 (Mateusz's decision): light supervised classifier over the latent "
+    "space — L2 logistic regression on the fused 1280-d embedding, same "
+    "protocol as every other arm; deterministic lbfgs",
+    make_model=_make_latent_logistic,
+    build_features=_features_latent_pure,
     supports_cv=True,
 )
 
