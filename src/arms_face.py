@@ -31,12 +31,14 @@ best a customer-identity proxy:
 
 Determinism (decision D5, exact rule): the latent seed for customer C is
 
-  seed = int.from_bytes(sha256(("face-arm-v1:" + C).encode("utf-8")).digest()[:8], "big")
+  seed = int.from_bytes(sha256(("face-arm-v1:" + C).encode("utf-8")).digest()[:4], "big")
 
 (the "face-arm-v1:" prefix domain-separates the hash from any other
-customer-keyed seed in the repo); z = numpy.random.RandomState(seed).randn(1,
-G.z_dim); w = G.mapping(z, None, truncation_psi=0.7); img = G.synthesis(w,
-noise_mode="const", force_fp32=True). No torch RNG is consumed (the const
+customer-keyed seed in the repo; the FIRST 4 BYTES are read because numpy's
+legacy RandomState accepts only 0..2**32-1); z =
+numpy.random.RandomState(seed).randn(1, G.z_dim); w = G.mapping(z, None,
+truncation_psi=0.7); img = G.synthesis(w, noise_mode="const",
+force_fp32=True). No torch RNG is consumed (the const
 noise buffers are baked into the pkl), so the same customer_id yields the
 same pixels on this machine. DETERMINISM IS ANCHORED TO THE CACHE: the
 committed JPEG under data/faces/ is the canonical image, and the committed
@@ -180,9 +182,12 @@ def check_dependencies():
 def customer_seed(customer_id):
     # D5 seed rule — the single source of image identity. SHA-256 so the seed
     # is stable across processes and platforms (hash() is salted per process
-    # and must never be used for this).
+    # and must never be used for this). Truncated to the FIRST 4 BYTES: the
+    # consumer is numpy's legacy MT19937 RandomState, whose seeding only
+    # accepts 0..2**32-1 (a 64-bit int raises ValueError) — 32 bits of a
+    # uniform digest is 100 customers' worth of collision headroom by miles.
     digest = hashlib.sha256((SEED_RULE_PREFIX + customer_id).encode("utf-8")).digest()
-    return int.from_bytes(digest[:8], "big")
+    return int.from_bytes(digest[:4], "big")
 
 
 def face_path(customer_id, faces_dir=FACE_DIR):
@@ -407,8 +412,9 @@ def save_embeddings(frame, path=EMBEDDINGS_NPZ_PATH):
         customer_id=np.asarray(frame.index, dtype="U"),
         embeddings=frame[FACE_FEATURES].to_numpy(dtype=np.float32),
         seed_rule=np.asarray(
-            ["sha256('%s' + customer_id)[:8] BE int -> RandomState.randn(z_dim), "
-             "truncation_psi=%.1f, noise_mode=const, force_fp32" % (SEED_RULE_PREFIX, TRUNCATION_PSI)],
+            ["sha256('%s' + customer_id)[:4] BE int (32-bit, RandomState range) "
+             "-> RandomState.randn(z_dim), truncation_psi=%.1f, noise_mode=const, "
+             "force_fp32" % (SEED_RULE_PREFIX, TRUNCATION_PSI)],
             dtype="U",
         ),
     )
