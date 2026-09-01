@@ -782,3 +782,136 @@ every arm including the new ones.
 - **F4 (faces / latent space) is queued AFTER F3** per the 2026-08-31
   decision — out of F3 scope.
 
+
+## §5 F4 — latent space: multi-modal embeddings + fusion (FOC-178)
+
+F4 asked one question four ways: **does a dense multi-modal representation add anything the
+tabular arms cannot already express?** The modalities are face (per-customer synthetic face →
+FaceNet, nb13), text (per-transaction synthesized description → MiniLM, nb14 — decision D4),
+demographics (per-customer `dim_customer` profile text → the same MiniLM backbone, nb15), and
+their fusion (nb15). All four ship as feature-sets in the unified runner
+(`face-features`, `text-features-minilm-l6`, `demo-features`, `latent-fusion`), evaluated by
+the F3 protocol on all three axes; **`random-grouped` remains the PRIMARY header axis**.
+
+### 5.1 Per-modality notes
+
+**Faces (nb13, decision D5).** No image data exists in this repo, so every face is synthetic:
+one StyleGAN2-ADA (FFHQ) image per customer, generated deterministically —
+`seed = sha256("face-arm-v1:" + customer_id)[:4]` (32-bit, `np.random.RandomState` range) →
+z-vector → 1024² synthesis at `truncation_psi=0.7` (cache: `data/faces/<customer_id>.jpg`,
+5.6 MB for all 100; `thispersondoesnotexist.com` was rejected as non-reproducible — no seeded
+draw, no hash-verifiable cache). FaceNet (InceptionResnetV1, VGGFace2) embeds each 160 px crop
+to a 512-d L2-normalized unit vector broadcast to the customer's rows
+(`data/face_embeddings.npz`).
+- *Determinism (aligned by identity, never positionally — the F3 r2 rule):* cache pass 2
+  regenerated 0 files; a full cache-bypass re-embed reindexed on `customer_id` differed by
+  **0.0** (bit-identical); the regenerated JPEG is byte-identical to the committed one.
+- *Pre-registered result:* appearance carries **no fraud signal** — on the PRIMARY axis the
+  arm sits at/below chance with a CI covering it. On the chronological axis it separates —
+  the same identity-memorization artifact F3 measured at 0.24 lift: a per-customer constant
+  vector is a customer id in disguise wherever customers straddle train/test. Both
+  customer-grouped axes sever that channel by construction, and there the block is noise.
+- *Ethical caveat (blocking any real-world use):* appearance-based fraud scoring is
+  discriminatory by construction — face embeddings correlate with protected attributes
+  (age, gender, ethnicity proxies), so any downstream threshold encodes appearance bias into
+  who gets flagged. The block exists here purely as a methods-comparability experiment with a
+  pre-registered null expectation; it must not graduate into a deployed scorer. The honest
+  use of per-customer embeddings is entity resolution (same face = same customer), not risk.
+
+**Text (nb14, decision D4 — experimental).** The table has **no free-text column** (longest
+raw value: 15 chars), so the text is synthesized deterministically from row content —
+seed = `sha256(customer|timestamp)`, three template shapes over per-type subjects, amount,
+both account ids + countries, fixed amount-band descriptors; a pure function of fields the
+tabular arms already see, verified shuffle-pure (5299 distinct texts over 5302 rows).
+Candidates were the two locally cached MiniLM checkpoints (no runtime downloads on this
+link): L6 scored 0.0122 vs L12 0.0323 on PRIMARY — but L12's CI [0.0084, 0.1604] sits inside
+the ~0.05 noise budget at 13 test positives, so the cheaper L6 won. **Synthetic-data caveat:**
+these embeddings re-encode known tabular signal — the experiment validates method plumbing,
+not real-world text value; a genuine text arm needs a real field (dispute notes, merchant
+descriptors) the table does not carry.
+
+**Demographics (nb15).** Each customer's 8 `dim_customer` fields render into one fixed
+profile sentence ("gender M, age 39, unemployed in the technology industry, …") embedded by
+the same MiniLM-L6 (one backbone across text-shaped modalities, so modality deltas come from
+content, not encoder choice). Fields are asserted constant per customer; the corpus digest in
+`data/demo_embeddings.npz` invalidates the cache if `dim_customer` changes. This is a dense
+re-encoding of columns xgb-client already one-hots — pre-registered expectation: no lift.
+
+### 5.2 Fusion choice: stateless concat, deliberately not alignment
+
+`latent-fusion` concatenates the three L2-normalized blocks (face 512 + text 384 + demo 384 =
+1280 dims) on top of the xgb-client matrix. **No fitted projection and no alignment**, for
+two reasons stated before any results (nb15): (1) the runner contract evaluates
+`build_features` on the full frame *pre-split* — anything fit there (PCA, CCA, Procrustes, a
+learned fusion head) leaks test structure; refitting per split inside `make_model` would fix
+the leak but make features split-dependent, breaking the cached label-free extraction
+contract every arm follows; (2) 100 customers cannot support a fitted shared space. Concat of
+unit-norm blocks is the leak-free "one latent space": each modality contributes unit length,
+so none dominates by scale, cross-modal geometry stays readable, and the downstream XGB is
+per-feature monotone-invariant anyway — the normalization matters for the distance/angle
+threshold consumers F5 is planned to need. A `latent-pure` ablation (the 1280 dims WITHOUT
+the tabular base, in nb15 only) attributes how much of the fused result is embeddings alone.
+Determinism: two cache-bypass fusion builds aligned on row identity — max |delta| = 0.0.
+
+### 5.3 Comparison tables (embedding arms × 3 axes, runner protocol)
+
+random-grouped axis (PRIMARY; 977 test rows, 13 positives, chance 0.0133):
+
+| Arm | Test PR-AUC | 95% CI | ROC-AUC | F1@frozen | Recall@prec=0.50 | CV PR-AUC (mean±std) | Test positives | Chance level |
+|---|---|---|---|---|---|---|---|---|
+| xgb-client | 0.0144 | 0.0079–0.0300 | 0.4844 | 0.0000 | 0.0000 | 0.6812±0.0768 | 13 | 0.0133 |
+| face-features | 0.0110 | 0.0070–0.0198 | 0.3989 | 0.0000 | 0.0000 | 0.7770±0.1381 | 13 | 0.0133 |
+| text-features-minilm-l6 | 0.0122 | 0.0069–0.0253 | 0.4220 | 0.0000 | 0.0000 | 0.5331±0.1358 | 13 | 0.0133 |
+| demo-features | 0.0114 | 0.0064–0.0239 | 0.3714 | 0.0000 | 0.0000 | 0.7353±0.1124 | 13 | 0.0133 |
+| latent-fusion | 0.0174 | 0.0084–0.0503 | 0.5348 | 0.0000 | 0.0000 | 0.6033±0.0924 | 13 | 0.0133 |
+
+grouped axis (stress; 831 test rows, 11 positives, chance 0.0132):
+
+| Arm | Test PR-AUC | 95% CI | ROC-AUC | F1@frozen | Recall@prec=0.50 | CV PR-AUC (mean±std) | Test positives | Chance level |
+|---|---|---|---|---|---|---|---|---|
+| xgb-client | 0.0091 | 0.0050–0.0154 | 0.2543 | 0.0000 | 0.0000 | 0.7277±0.0599 | 11 | 0.0132 |
+| face-features | 0.0165 | 0.0089–0.0350 | 0.5737 | 0.0000 | 0.0000 | 0.7742±0.0813 | 11 | 0.0132 |
+| text-features-minilm-l6 | 0.0176 | 0.0080–0.0566 | 0.5551 | 0.0000 | 0.0000 | 0.5025±0.1170 | 11 | 0.0132 |
+| demo-features | 0.0118 | 0.0059–0.0268 | 0.3518 | 0.0000 | 0.0000 | 0.7608±0.0884 | 11 | 0.0132 |
+| latent-fusion | 0.0194 | 0.0097–0.0480 | 0.6157 | 0.0000 | 0.0000 | 0.5943±0.0859 | 11 | 0.0132 |
+
+chronological axis (identity-straddling; 1061 test rows, 24 positives, chance 0.0226):
+
+| Arm | Test PR-AUC | 95% CI | ROC-AUC | F1@frozen | Recall@prec=0.50 | CV PR-AUC (mean±std) | Test positives | Chance level |
+|---|---|---|---|---|---|---|---|---|
+| xgb-client | 0.2374 | 0.0850–0.4262 | 0.7692 | 0.2667 | 0.2083 | 0.5227±0.0809 | 24 | 0.0226 |
+| face-features | 0.2617 | 0.0991–0.4574 | 0.6928 | 0.0800 | 0.2500 | 0.5880±0.0986 | 24 | 0.0226 |
+| text-features-minilm-l6 | 0.0691 | 0.0174–0.1730 | 0.5736 | 0.0800 | 0.0417 | 0.4166±0.0398 | 24 | 0.0226 |
+| demo-features | 0.2341 | 0.0898–0.4184 | 0.6851 | 0.0769 | 0.1667 | 0.5585±0.0975 | 24 | 0.0226 |
+| latent-fusion | 0.1260 | 0.0383–0.2739 | 0.7191 | 0.1333 | 0.0417 | 0.4738±0.0671 | 24 | 0.0226 |
+
+### 5.4 Interpretation (honest read)
+
+- **PRIMARY axis (cohort-random, customer-grouped): every F4 arm is indistinguishable from
+  chance** — PR-AUC at/below 0.02 with 95% CIs covering 0.0133, same as all nine F3 arms. The
+  pre-registered null holds for every modality and for the fusion.
+- **Grouped (stress) axis:** same collapse — nothing separates.
+- **Chronological axis:** face-features (and to a lesser degree the fused space, which
+  contains the face block) post the largest lifts — this is the F3 identity-memorization
+  artifact again, now via per-customer embedding constants. It is NOT transferable signal:
+  the customer-grouped axes are the honest ones, and there every embedding arm is noise.
+- The fusion adds nothing over its constituents on any axis — expected, since each block is a
+  per-customer or per-row re-encoding of fields the tabular matrix already carries. The
+  nb15 ablation (`latent-pure`) confirms the tabular base does the work wherever anything
+  separates.
+- The F4 deliverable that matters is comparability: four cached, label-free, deterministic
+  feature-sets in the runner registry, re-runnable per arm/axis in minutes when more labeled
+  data arrives (`python src/fraud_pipeline.py --run-arm <arm> --axis <axis>`).
+
+### 5.5 F4 open items
+
+- F5 (threshold/anomaly layer over this latent space) is intentionally NOT built here —
+  the fused space above is its input.
+- `data/faces/`, `data/face_embeddings.npz`, `data/demo_embeddings.npz` are committed
+  artifacts (5.7 MB total) — regenerating them needs the StyleGAN checkout at `C:/sg2-ada`
+  + `C:/faces/ffhq.pkl` and the phase venv; consuming them needs numpy/pandas only.
+- StyleGAN2's custom CUDA ops fail to build under torch 2.11 (upfirdn2d/bias_act fall back
+  to the reference implementation): slower but deterministic, and irrelevant after the
+  one-time generation — noted so a future re-generation does not read the warnings as errors.
+- The §4.5 docstring-staleness item is resolved in F4 (module docstring now lists all 13
+  wired arms); the stat-context hash-pin decision remains open for the owner.
