@@ -230,7 +230,7 @@ def embed_customers(customer_ids, texts, corpus_digest, use_cache=True,
     )
     if use_cache:
         _EMBEDDING_CACHE[corpus_digest] = frame
-        save_embeddings(frame, npz_path)
+        save_embeddings(frame, corpus_digest, npz_path)
     return frame
 
 

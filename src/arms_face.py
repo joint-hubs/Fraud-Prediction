@@ -146,7 +146,24 @@ TRUNCATION_PSI = 0.7
 # rule cannot silently reuse old latents (domain separation, see docstring).
 SEED_RULE_PREFIX = "face-arm-v1:"
 
+# FaceNet weight file in the local torch-hub cache (facenet-pytorch 2.5.3
+# resolves vggface2 through torch.hub.load_state_dict_from_url, which serves
+# the cache FIRST and only downloads on a miss). check_dependencies probes
+# this exact file so a generation run can never reach the network — the same
+# no-download discipline as arms_text's local_files_only snapshot probe.
+FACENET_WEIGHTS_FILENAME = "20180402-114759-vggface2.pt"
+
 FACE_FEATURES = ["face_emb_%03d" % i for i in range(EMB_DIM)]
+
+
+def _seed_rule_current():
+    # The exact provenance string written into the npz (single source of
+    # truth for save AND for the staleness gate at load).
+    return (
+        "sha256('%s' + customer_id)[:4] BE int (32-bit, RandomState range) "
+        "-> RandomState.randn(z_dim), truncation_psi=%.1f, noise_mode=const, "
+        "force_fp32" % (SEED_RULE_PREFIX, TRUNCATION_PSI)
+    )
 
 _GENERATOR = None
 _FACENET = None
@@ -170,6 +187,15 @@ def check_dependencies():
             missing.append("%s (%s)" % (module, exc))
     if missing:
         return "; ".join(missing)
+    import torch.hub  # lazy: torch already imported above
+
+    weights_path = Path(torch.hub.get_dir()) / "checkpoints" / FACENET_WEIGHTS_FILENAME
+    if not weights_path.is_file():
+        return (
+            "FaceNet %s weights not in the local torch-hub cache (%s) — "
+            "download once at setup; runtime must never fetch"
+            % (FACENET_PRETRAINED, weights_path)
+        )
     if not (STYLEGAN_REPO_DIR / "dnnlib").is_dir() or not (
         STYLEGAN_REPO_DIR / "legacy.py"
     ).is_file():
@@ -369,20 +395,30 @@ def embed_customers(customer_ids, use_cache=True, device=None):
 
 
 def _read_npz(path):
-    # Shared npz reader: returns (ids, embeddings float32) or None.
+    # Shared npz reader: returns (ids, embeddings float32, seed_rule str) or
+    # None when the artifact does not exist. A legacy npz without the
+    # seed_rule field reads as "" — the gate below treats it as stale.
     if not Path(path).is_file():
         return None
     with np.load(path, allow_pickle=False) as data:
-        return list(data["customer_id"]), data["embeddings"].astype(np.float32)
+        seed_rule = str(data["seed_rule"][0]) if "seed_rule" in data.files else ""
+        return list(data["customer_id"]), data["embeddings"].astype(np.float32), seed_rule
 
 
 def load_embeddings(path=EMBEDDINGS_NPZ_PATH):
     # The committed artifact as a DataFrame (index=customer_id), or None when
-    # it does not exist yet (first generation run writes it).
+    # it does not exist yet (first generation run writes it) or when it is
+    # STALE: a seed_rule that does not match the current rule means the file
+    # was produced under a different latents rule (e.g. the 64->32-bit fix)
+    # and must be regenerated, never consumed — the same trust-gate class as
+    # arms_demo's corpus digest (review r1). Self-heals: the next fresh pass
+    # overwrites the file with the current rule.
     read = _read_npz(path)
     if read is None:
         return None
-    ids, embeddings = read
+    ids, embeddings, seed_rule = read
+    if seed_rule != _seed_rule_current():
+        return None
     frame = pd.DataFrame(embeddings, index=ids, columns=FACE_FEATURES)
     return frame.sort_index()
 
@@ -411,12 +447,7 @@ def save_embeddings(frame, path=EMBEDDINGS_NPZ_PATH):
         path,
         customer_id=np.asarray(frame.index, dtype="U"),
         embeddings=frame[FACE_FEATURES].to_numpy(dtype=np.float32),
-        seed_rule=np.asarray(
-            ["sha256('%s' + customer_id)[:4] BE int (32-bit, RandomState range) "
-             "-> RandomState.randn(z_dim), truncation_psi=%.1f, noise_mode=const, "
-             "force_fp32" % (SEED_RULE_PREFIX, TRUNCATION_PSI)],
-            dtype="U",
-        ),
+        seed_rule=np.asarray([_seed_rule_current()], dtype="U"),
     )
 
 
