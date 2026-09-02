@@ -940,7 +940,7 @@ appends; nb15's `latent-pure` ablation uses the same frame):
 
 | Arm | Score (higher = more anomalous) | Reference fitted on | Dictionary-model analogue |
 |---|---|---|---|
-| `latent-nn-dist` | distance to the 5th-nearest legitimate fitting row (self-matches excluded for calibration) | legit fit carve | per-row "exceeds cutoff" flags |
+| `latent-nn-dist` | distance to the 5th-nearest legitimate fitting row (own row excluded by row identity for calibration) | legit fit carve | per-row "exceeds cutoff" flags |
 | `latent-centroid-dist` | Euclidean distance to the legitimate centroid | legit fit carve | distance thresholds |
 | `latent-cosine-centroid` | angular score `1 − cos` to the legitimate mean direction | legit fit carve | angle thresholds (blocks are L2-normalized — the angle is the geometry) |
 | `latent-cluster-anom` | distance to the nearest k-means center (k=8) | legit fit carve, TRAIN ONLY | anomaly within clusters |
@@ -1021,12 +1021,12 @@ descriptive, not inferential):
 
 | Arm | Percentile | Threshold | Flagged (of 977) | Precision | Recall |
 |---|---|---|---|---|---|
-| latent-nn-dist | q95 | 0.7763 | 977 | 0.0133 | 1.0000 |
+| latent-nn-dist | q95 | 0.7896 | 977 | 0.0133 | 1.0000 |
 | latent-centroid-dist | q95 | 1.2928 | 112 | 0.0000 | 0.0000 |
 | latent-cosine-centroid | q95 | 0.3320 | 112 | 0.0000 | 0.0000 |
 | latent-cluster-anom | q95 | 1.2107 | 401 | 0.0175 | 0.5385 |
 | latent-gmm-density | q95 | −36.6767 | 427 | 0.0281 | 0.9231 |
-| latent-nn-dist | q99 | 0.8481 | 977 | 0.0133 | 1.0000 |
+| latent-nn-dist | q99 | 0.8716 | 977 | 0.0133 | 1.0000 |
 | latent-centroid-dist | q99 | 1.3436 | 18 | 0.0000 | 0.0000 |
 | latent-cosine-centroid | q99 | 0.3628 | 18 | 0.0000 | 0.0000 |
 | latent-cluster-anom | q99 | 1.2620 | 228 | 0.0132 | 0.2308 |
@@ -1039,7 +1039,17 @@ the reference set at all — so the k-NN distance measures *customer novelty*, n
 the customer-disjoint discipline doing its job, and it is why the arm's PR-AUC sits at chance
 despite flagging everything: the score carries no fraud information that transfers across
 customers. The GMM's q95 point (precision 0.0281, recall 0.9231) is the only operating point that
-beats chance precision at meaningful recall — read with §6.5's caveat below.
+beats chance precision at meaningful recall — read with §6.6's caveat below.
+
+One calibration subtlety was fixed after review (TEST finding on FOC-179): the self-match
+exclusion originally used a distance cutoff (`dists[:, 0] < 1e-12`), but sklearn's self distance
+is ~3e-8 of dot-product-expansion noise — not exact 0 — so 2350 of the 3185 legitimate fit rows
+kept their own match inside the percentile calibration, deflating the operating points (q99 0.8481
+instead of 0.8716). Self is now excluded by neighbour-index identity (`_calibration_scores` in
+`arms_latent.py`); the table above shows the corrected values. The fix is calibration-purity only:
+out-of-sample scores are bit-identical (max |delta| = 0.0 over the 977 test rows), so PR-AUC,
+ROC-AUC, F1@frozen and the runner's own frozen threshold are unchanged — the canonical JSONL rows
+for `latent-nn-dist` re-ran byte-identical.
 
 ### 6.5 Determinism
 
@@ -1051,6 +1061,11 @@ beats chance precision at meaningful recall — read with §6.5's caveat below.
   k-means `n_init=10`, PCA randomized SVD, GMM init); the JSONL carries no wall-clock fields.
 - Notebook vs CLI agreement: the nb16-measured F5 rows match the canonical CLI rows (same
   protocol, same seeds) — e.g. `latent-gmm-density` PRIMARY 0.0229 [0.0134–0.0439] in both.
+- **Review-fix verification (nn-dist calibration purity):** the old distance-cutoff heuristic was
+  reproduced exactly (self-match missed for 2350/3185 legit fit rows; old q95/q99 = 0.7763/0.8481),
+  the corrected identity-based path lands at 0.7896/0.8716, a re-fit reproduces the corrected
+  thresholds exactly, and the regenerated canonical JSONL rows are byte-identical to the pre-fix
+  ones (out-of-sample scores unchanged).
 
 ### 6.6 Interpretation (honest read)
 
