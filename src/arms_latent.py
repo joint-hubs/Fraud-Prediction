@@ -55,10 +55,13 @@ class _LatentAnomalyBase(BaseEstimator):
         if len(legit) < 2:
             raise ValueError("need at least 2 legitimate fitting rows")
         self._fit_reference(legit)
-        scores = self._score(X_arr)
         # Percentile over the LEGITIMATE fitting scores: the reference terrain
-        # defines "normal", so the operating point is its own tail.
-        self.train_percentile_ = float(np.percentile(scores[y_arr == 0], self.percentile))
+        # defines "normal", so the operating point is its own tail. Scorers
+        # whose reference contains the query rows override _calibration_scores
+        # to drop their self-match by row identity.
+        self.train_percentile_ = float(
+            np.percentile(self._calibration_scores(legit), self.percentile)
+        )
         self.reference_rows_ = int(len(legit))
         return self
 
@@ -67,6 +70,12 @@ class _LatentAnomalyBase(BaseEstimator):
 
     def _score(self, X):  # pragma: no cover - interface
         raise NotImplementedError
+
+    def _calibration_scores(self, X_legit):
+        # Scores of the reference rows themselves, as consumed by the
+        # percentile above. Default: identical to _score (centroid/density
+        # scorers have no per-row self-entry to remove).
+        return self._score(X_legit)
 
     def predict_proba(self, X):
         scores = self._score(np.asarray(X, dtype=np.float64))
@@ -84,9 +93,12 @@ class NearestLegitScorer(_LatentAnomalyBase):
     """Distance to the k-th nearest legitimate fitting row.
 
     Local-density version of the dictionary story: a transaction whose fused
-    embedding has no close legitimate neighbour is anomalous. Self-matches
-    are excluded when scoring legitimate fitting rows (the row's own distance
-    of exactly 0 would deflate the calibration percentiles).
+    embedding has no close legitimate neighbour is anomalous. When the
+    legitimate fitting rows are scored for calibration, each row's own
+    reference entry is excluded BY ROW IDENTITY, not by a distance cutoff —
+    sklearn's self distance is ~1e-8 of numeric noise rather than exact 0, so
+    a cutoff both misses the self-match and could misfire on genuine
+    near-duplicates.
     """
 
     def __init__(self, n_neighbors=5, percentile=99.0, metric="euclidean"):
@@ -99,17 +111,32 @@ class NearestLegitScorer(_LatentAnomalyBase):
 
         self.n_neighbors_ = int(min(self.n_neighbors, len(X_legit) - 1))
         self.nn_ = NearestNeighbors(
-            n_neighbors=self.n_neighbors_ + 1, metric=self.metric
+            n_neighbors=self.n_neighbors_, metric=self.metric
         ).fit(X_legit)
 
     def _score(self, X):
-        # k+1 columns so a legitimate fitting row can drop its own 0-distance
-        # self-match; a test row (not in the reference set) simply uses k.
-        dists, _ = self.nn_.kneighbors(X, n_neighbors=self.n_neighbors_ + 1)
-        self_present = dists[:, 0] < 1e-12
-        return np.where(
-            self_present, dists[:, self.n_neighbors_], dists[:, self.n_neighbors_ - 1]
-        )
+        # Out-of-sample rows: no self-match exists in the reference, so the
+        # k-th neighbour is genuine. Reference rows go through
+        # _calibration_scores, which removes their self-match by identity.
+        dists, _ = self.nn_.kneighbors(X, n_neighbors=self.n_neighbors_)
+        return dists[:, -1]
+
+    def _calibration_scores(self, X_legit):
+        # Self-exclusion by ROW IDENTITY (review fix): kneighbors returns
+        # positions into the reference and query i IS reference row i, so the
+        # self-match is masked by index. A distance cutoff cannot do this —
+        # sklearn's self distance is ~1e-8 of dot-product-expansion noise,
+        # not exact 0, which slipped past the old < 1e-12 heuristic and let
+        # the row's own match deflate the percentile calibration.
+        dists, idxs = self.nn_.kneighbors(X_legit, n_neighbors=self.n_neighbors_ + 1)
+        is_self = idxs == np.arange(len(X_legit))[:, None]
+        masked = np.where(is_self, np.inf, dists)
+        masked.sort(axis=1)
+        # k+1 columns: with self present k genuine neighbours remain; if an
+        # exact duplicate won the tie and pushed self out, k+1 genuine remain.
+        # The k-th genuine neighbour sits at position k-1 of the sorted row
+        # in both cases.
+        return masked[:, self.n_neighbors_ - 1]
 
 
 class CentroidScorer(_LatentAnomalyBase):

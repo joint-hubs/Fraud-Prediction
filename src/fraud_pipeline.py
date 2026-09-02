@@ -877,8 +877,8 @@ def _make_latent_logistic(y_fit):
 register_arm(
     "latent-nn-dist",
     "F5: distance to the 5th-nearest LEGITIMATE fitting row in the fused "
-    "1280-d space (self-matches excluded for calibration); percentile "
-    "threshold calibrated on legit fitting rows inside fit()",
+    "1280-d space (each calibration row's own reference entry excluded by "
+    "row identity); percentile threshold calibrated on legit fitting rows",
     make_model=_make_latent_nn_dist,
     build_features=_features_latent_pure,
     supports_cv=True,
