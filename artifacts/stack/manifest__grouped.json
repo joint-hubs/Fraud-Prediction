@@ -765,7 +765,7 @@
       "n_oof_rows": 4471,
       "n_test_rows": 831,
       "npz": "oof__latent-cluster-anom__grouped.npz",
-      "npz_sha256": "01bfd28e24d3a7708df046124a295049bb204b8b983757885e5eb99afadba02e",
+      "npz_sha256": "690cc758d36c8e37e856ef53d0eba3688430e35e63841092802e19aee199c8da",
       "status": "ok"
     },
     "latent-cosine-centroid": {
@@ -893,7 +893,7 @@
       "n_oof_rows": 4471,
       "n_test_rows": 831,
       "npz": "oof__latent-cosine-centroid__grouped.npz",
-      "npz_sha256": "8f6276f7e3ddad0983b58bada68b6246bc523f7ad27a1d3dc9eee2ec697ab4ce",
+      "npz_sha256": "0ce08c14e0690cbeaedd7e778a6c44e63c6acf3e11f55219e8087787add49fcc",
       "status": "ok"
     },
     "latent-fusion": {
@@ -1149,7 +1149,7 @@
       "n_oof_rows": 4471,
       "n_test_rows": 831,
       "npz": "oof__latent-gmm-density__grouped.npz",
-      "npz_sha256": "1917e6c81dc3cbecc1de2558ff5676ef4beb2389c18af1d1c33773fa828b5c58",
+      "npz_sha256": "c80911ecbc55ec5414f654bd3b1a5c8116b83c6e1982da2f2c0c2acb95690eef",
       "status": "ok"
     },
     "latent-logistic": {
@@ -1277,7 +1277,7 @@
       "n_oof_rows": 4471,
       "n_test_rows": 831,
       "npz": "oof__latent-logistic__grouped.npz",
-      "npz_sha256": "73c649976f68a977084fd5e0be9acbf071b094f4131820b39b35dbbd4e8269f6",
+      "npz_sha256": "fe979aef02a40e1e437ff36b11f3866248357f6fd163ad1d6826db8d20bb43d5",
       "status": "ok"
     },
     "latent-nn-dist": {
