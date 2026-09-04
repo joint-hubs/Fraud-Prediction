@@ -371,7 +371,7 @@ def run_stack_base(
         _save_manifest(stack_dir, axis, manifest)
         any_ok = True
         print(
-            "built    %-24s k=%d  oof=%d rows, test=%d rows, sha %s…"
+            "built    %-24s k=%d  oof=%d rows, test=%d rows, sha %s..."
             % (arm_name, k, len(train_idx), len(test_idx), manifest["arms"][arm_name]["npz_sha256"][:12])
         )
     _save_manifest(stack_dir, axis, manifest)
