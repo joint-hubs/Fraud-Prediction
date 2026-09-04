@@ -69,6 +69,9 @@ from pathlib import Path
 # loads; must stay the first project import in the CLI path (see module note).
 for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ[_var] = "1"  # force (not setdefault): nb17's kernel does the same
+# cublas split-k/atomics are run-to-run nondeterministic unless the workspace
+# is pinned — must be set before torch initializes CUDA (found via meta-ftt).
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 import numpy as np
 import pandas as pd
@@ -113,6 +116,17 @@ def _seed_everything():
         torch.manual_seed(RANDOM_STATE)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+        # GPU attention/backward kernels found run-to-run nondeterministic via
+        # the meta-ftt probe (bitwise drift in-process, whole different
+        # trajectories across processes): flash + memory-efficient SDPA
+        # backward accumulate dq/dk/dv with atomics, which cudnn.deterministic
+        # does not cover. The math SDPA kernel + deterministic-algorithms mode
+        # are bitwise stable; only the meta net's attention runs after this
+        # pin within a --run-stack process, so the global flags stay safe.
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
+        torch.use_deterministic_algorithms(True)
     except ImportError:
         pass
 
@@ -691,6 +705,12 @@ def _make_meta_ftt_net(layout):
             self.latent_w = torch.nn.Parameter(torch.empty(n_latent_tokens, self.d))
             self.latent_b = torch.nn.Parameter(torch.zeros(n_latent_tokens, self.d))
             self.cls = torch.nn.Parameter(torch.empty(1, 1, self.d))
+            # Root cause of the meta-ftt NaN probe: torch.empty leaves garbage
+            # (often NaN/1e38 bit patterns on CUDA) — explicit small-std init,
+            # drawn from the seeded stream set by _seed_everything in fit().
+            torch.nn.init.normal_(self.weight, std=0.02)
+            torch.nn.init.normal_(self.latent_w, std=0.02)
+            torch.nn.init.normal_(self.cls, std=0.02)
             layer = torch.nn.TransformerEncoderLayer(
                 d_model=self.d, nhead=4, dim_feedforward=128, dropout=0.1,
                 batch_first=True, norm_first=True,
@@ -750,6 +770,8 @@ def _train_torch(model, X_fit, y_fit, X_val, y_val, max_epochs=200, patience=10,
             opt.zero_grad()
             loss = loss_fn(model(x_fit_t[sel]).squeeze(-1), y_fit_t[sel])
             loss.backward()
+            # Gradient-spike guard, uniform across the torch meta variants.
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
         model.eval()
         with torch.no_grad():
