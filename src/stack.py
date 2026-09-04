@@ -149,8 +149,9 @@ def _save_npz_deterministic(path, arrays):
 def _identity_arrays(enriched, idx):
     sub = enriched.loc[idx]
     assert sub["timestamp"].notna().all(), "identity: NaT timestamps in split"
+    customer = np.array(sub["customer"].astype(str).tolist())  # U-dtype, not object
     return (
-        sub["customer"].astype(str).to_numpy(),
+        customer,
         sub["timestamp"].astype("int64").to_numpy(),  # ns since epoch
         np.asarray(sub.index, dtype=np.int64),
     )
@@ -166,6 +167,19 @@ def _assert_identity_match(identity_a, identity_b, what):
     key_a, key_b = _identity_key(identity_a), _identity_key(identity_b)
     for a, b in zip(key_a, key_b):
         assert np.array_equal(a, b), "%s: row identity mismatch" % what
+
+
+def _assert_identity_disjoint(identity_a, identity_b, what):
+    # AC2 leakage probe: no (customer, timestamp, row index) triple may appear
+    # in both a fold and the fit set that produced that fold's OOF proba.
+    merged = tuple(np.concatenate([a, b]) for a, b in zip(identity_a, identity_b))
+    customer, ts_ns, row_index = _identity_key(merged)
+    dup = (
+        (row_index[1:] == row_index[:-1])
+        & (ts_ns[1:] == ts_ns[:-1])
+        & (customer[1:] == customer[:-1])
+    )
+    assert not dup.any(), "%s: fold rows present in the fold's fit set" % what
 
 
 # ---------------------------------------------------------------------------
@@ -232,7 +246,7 @@ def oof_one_arm(arm_name, enriched, y, train_idx, test_idx, k):
         fit_pos = np.flatnonzero(fold_labels != i)
         # AC2 fold integrity: the fold's OOF proba must never come from a model
         # fit on that fold's rows — asserted on row identity, per fold.
-        _assert_identity_match(
+        _assert_identity_disjoint(
             tuple(arr[fit_pos] for arr in train_ident),
             tuple(arr[fold_pos] for arr in train_ident),
             "%s fold %d leakage probe" % (arm_name, i),
