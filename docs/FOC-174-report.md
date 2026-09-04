@@ -1110,3 +1110,216 @@ for `latent-nn-dist` re-ran byte-identical.
   the same). A grouped-CV variant is a natural follow-up, deliberately NOT built in F5.
 - No new dependency was introduced; nothing to pin. `arms_latent.py` uses numpy + sklearn only.
 - Scope boundary respected: SEC (FOC-181), merge to main, push — all out of F5.
+
+## §7 F6 — stacked meta-model over method predictions + the latent space (FOC-211)
+
+### 7.1 Environment
+
+Same worktree venv (`C:/venv-f5`, Python 3.11.9, torch 2.11.0+cu128, sklearn 1.7.2, xgboost 2.1.4 —
+all already pinned by F0-F4; **no new dependency**). Two machine-level determinism pins live in
+`src/stack.py` and are re-stated by nb17's env cell BEFORE the first numpy import: CPU
+BLAS/OpenMP threads forced to 1 (§6.5's 1-ulp KMeans story) and `CUBLAS_WORKSPACE_CONFIG=:4096:8`
+forced before CUDA init (§7.5's GPU story). OOF caches live in `artifacts/stack/`
+(`oof__<arm>__<axis>.npz` + one `manifest__<axis>.json` with sha256 digests, deterministic fold
+assignments and per-fold fit sizes); attention diagnostics in `attn__<axis>__<variant>.json`.
+
+### 7.2 Method — leak-free stacked generalization
+
+F6's question: does a **second-level model over the arms' own predictions** (plus the raw inputs)
+beat the arms? The protocol (`src/stack.py`, two CLI phases — one `--run-stack-base` per axis,
+one `--run-stack` per axis) is stacked generalization under the F0-F4 runner discipline:
+
+- **Out-of-fold base predictions.** For each of the 19 base arms, the TRAIN side is split into
+  k=5 folds grouped by customer — a deterministic greedy assignment over sorted customer ids
+  balancing fold fraud count, then row count, then fold index (`assign_folds`). Fold i's OOF
+  probabilities come from a model fitted on the other k-1 folds only; a per-fold row-identity
+  disjointness probe asserts the fit never saw the rows it predicts. A separate full-TRAIN fit
+  produces the TEST predictions. Expensive arms were NOT dropped: all 19 arms run at k=5 on every
+  axis (largest single-arm OOF cost ~2 min; no k=3 fallback was needed).
+- **Meta matrix.** `[19 arm OOF probas | 19 missing-arm mask flags | 116 raw tabular |
+  1280-d fused latent]` = 1434 columns (1428 for the sensitivity variant, which drops three arms
+  entirely — no proba column, no mask). Column order keeps the FTT variant's scalar tokens
+  contiguous. Missing-arm tolerance: an arm skipped at base time contributes a NaN proba + a mask
+  flag (all 19 arms are `ok` on every axis here, so the masks are all-zero on this dataset — the
+  tolerance machinery is exercised, its effect is not).
+- **Single meta-val carve.** ONE stratified 25% carve of TRAIN (seed 42, `stratify`) serves both
+  model selection (torch early stopping on val PR-AUC; logistic C sweep over {0.01, 0.1, 1}) and
+  the frozen best-F1 threshold — the same single-carve contract the arms use. Meta rows therefore
+  carry no `cv_*` fields (deliberate schema deviation from the base-arm rows, justified in §7.6:
+  the OOF layer IS the generalization signal; a row-stratified CV over OOF features would reuse
+  the folds it came from). Test evaluation reuses the runner's `best_f1_threshold`,
+  `rich_test_metrics` and `bootstrap_auc_ci` verbatim.
+- **Variants.** `meta-attn` (PRIMARY: per-arm embeddings + multi-head attention pooling over the
+  19 arm tokens, mean attention per arm logged as diagnostics), `meta-ftt` (per-scalar-feature
+  tokens + 2-layer FT-Transformer, d=64), `meta-logit` (standardized logistic, C swept on the
+  carve), `meta-blend` (zero-fit nanmean of available arm probas — the reference every learned
+  variant must beat), `meta-xgb` (shallow histogram tree, early stopping 50), plus
+  `meta-attn-sens` on the chronological axis only: `meta-attn` re-fit without
+  `latent-nn-dist`/`face-features`/`demo-features` — **labeled sensitivity, not a purity
+  certificate**. Torch variants seed python/numpy/torch + cudnn.deterministic + deterministic
+  algorithms before every fit and train with grad-norm clipping (1.0); the blend reads raw arm
+  outputs (§7.6 notes the scale consequence).
+
+Every join runs on the identity triple `(customer, timestamp, row_index)` (U-dtype strings, int64
+ns, int64 row index) with asserted match and disjointness; the deterministic npz writer (fixed
+ZipInfo timestamps, ZIP_STORED, `allow_pickle=False`) is what makes the caches byte-stable.
+
+### 7.3 Comparison tables (meta variants + context × 3 axes, runner protocol)
+
+Context rows (best single arm + anchors) come from the accumulated JSONL (73 rows after F6's 16).
+Meta rows carry no CV column (single-carve protocol, §7.2); threshold and n_features are shown to
+make the protocol explicit.
+
+random-grouped axis (PRIMARY; 977 test rows, 13 positives, chance 0.0133):
+
+| Arm | Test PR-AUC | 95% CI | ROC-AUC | F1@frozen | Recall@prec=0.50 | Frozen threshold | n_features | Chance level |
+|---|---|---|---|---|---|---|---|---|
+| dictionary (best base arm) | 0.0231 | 0.0122–0.0469 | 0.6642 | 0.0000 | 0.0000 | 0.8355 | 94 | 0.0133 |
+| meta-attn | 0.0240 | 0.0117–0.0606 | 0.5789 | 0.0000 | 0.0000 | 0.9841 | 1434 | 0.0133 |
+| meta-ftt | 0.0205 | 0.0111–0.0449 | 0.6444 | 0.0000 | 0.0000 | 0.9972 | 1434 | 0.0133 |
+| meta-logit | 0.0217 | 0.0095–0.0582 | 0.5496 | 0.0000 | 0.0000 | 0.6307 | 1434 | 0.0133 |
+| meta-blend | 0.0211 | 0.0112–0.0491 | 0.6507 | 0.0263 | 0.0000 | −2.5597 | 1434 | 0.0133 |
+| meta-xgb | 0.0200 | 0.0098–0.0469 | 0.6025 | 0.0000 | 0.0000 | 0.9106 | 1434 | 0.0133 |
+
+Every meta CI covers chance (lowest CI bound 0.0095 vs chance 0.013306). The pre-registered
+PRIMARY null holds.
+
+grouped axis (stress; 831 test rows, 11 positives, chance 0.0132):
+
+| Arm | Test PR-AUC | 95% CI | ROC-AUC | F1@frozen | Recall@prec=0.50 | Frozen threshold | n_features | Chance level |
+|---|---|---|---|---|---|---|---|---|
+| sequential-lstm (best base arm) | 0.0353 | 0.0070–0.1934 | 0.4741 | 0.0274 | 0.0000 | 0.5935 | 12 | 0.0132 |
+| meta-attn | 0.0117 | 0.0058–0.0287 | 0.3701 | 0.0000 | 0.0000 | 0.9794 | 1434 | 0.0132 |
+| meta-ftt | 0.0102 | 0.0052–0.0226 | 0.2981 | 0.0000 | 0.0000 | 0.9852 | 1434 | 0.0132 |
+| meta-logit | 0.0132 | 0.0065–0.0292 | 0.4548 | 0.0000 | 0.0000 | 0.2716 | 1434 | 0.0132 |
+| meta-blend | 0.0154 | 0.0077–0.0334 | 0.5242 | 0.0000 | 0.0000 | −0.8196 | 1434 | 0.0132 |
+| meta-xgb | 0.0201 | 0.0087–0.0495 | 0.5754 | 0.0000 | 0.0000 | 0.3990 | 1434 | 0.0132 |
+
+chronological axis (identity-straddling; 1061 test rows, 24 positives, chance 0.0226):
+
+| Arm | Test PR-AUC | 95% CI | ROC-AUC | F1@frozen | Recall@prec=0.50 | Frozen threshold | n_features | Chance level |
+|---|---|---|---|---|---|---|---|---|
+| face-features (best base arm) | 0.2617 | 0.0991–0.4574 | 0.6928 | 0.0800 | 0.2500 | 0.9274 | 628 | 0.0226 |
+| meta-attn | 0.1076 | 0.0479–0.2348 | 0.7657 | 0.0667 | 0.0417 | 0.9862 | 1434 | 0.0226 |
+| meta-ftt | 0.0521 | 0.0212–0.1560 | 0.6487 | 0.0741 | 0.0417 | 0.9088 | 1434 | 0.0226 |
+| meta-logit | 0.0213 | 0.0131–0.0360 | 0.4737 | 0.0000 | 0.0000 | 0.4241 | 1434 | 0.0226 |
+| meta-blend | 0.0952 | 0.0312–0.2050 | 0.6880 | 0.1356 | 0.0417 | −1.7838 | 1434 | 0.0226 |
+| meta-xgb | 0.1015 | 0.0268–0.2273 | 0.6510 | 0.0667 | 0.0417 | 0.5360 | 1434 | 0.0226 |
+| meta-attn-sens (drops latent-nn-dist, face-features, demo-features) | 0.1064 | 0.0381–0.2186 | 0.7530 | 0.0769 | 0.0417 | 0.9924 | 1428 | 0.0226 |
+
+Four chronological rows separate from chance on the CI bound (meta-attn, meta-blend, meta-xgb,
+meta-attn-sens) — §7.6 reads these as the known artifact axis, not as stacking value: the meta
+variants sit far below that axis's best single arm (0.2617), and F4/F5 already documented why
+chronological lift is identity/novelty, not transferable signal.
+
+### 7.4 Attention diagnostics (meta-attn)
+
+The PRIMARY variant's own account of which inputs it used — mean attention per arm over the
+meta-val carve (nb17 cell 7; identical tables were verified bitwise against the CLI-written
+`attn__<axis>__<variant>.json`). Top-5 and bottom-2 per fit:
+
+| Fit (val PR-AUC, epochs) | Top arms | Bottom arms |
+|---|---|---|
+| random-grouped `meta-attn` (0.5327, 30) | latent-gmm-density 0.3255, xgb-baseline 0.0520, latent-nn-dist 0.0490, latent-centroid-dist 0.0478, latent-cluster-anom 0.0465 | sequential-lstm 0.0265, sce 0.0248 |
+| grouped `meta-attn` (0.5994, 45) | latent-gmm-density 0.3272, xgb-baseline 0.0553, latent-centroid-dist 0.0477, latent-nn-dist 0.0471, latent-cluster-anom 0.0466 | gbdt-ensemble 0.0275, sce 0.0253 |
+| chronological `meta-attn` (0.5883, 38) | latent-gmm-density 0.4125, xgb-baseline 0.0505, dictionary 0.0488, latent-centroid-dist 0.0422, latent-nn-dist 0.0383 | gbdt-ensemble 0.0224, sce 0.0196 |
+| chronological `meta-attn-sens` (0.5783, 31) | latent-gmm-density 0.5129, latent-cluster-anom 0.0797, dictionary 0.0610, latent-centroid-dist 0.0398, timesfm-features 0.0380 | gbdt-ensemble 0.0195, xgb-baseline 0.0172 |
+
+Read: the pool concentrates on the anomaly-scorer block — above all `latent-gmm-density` (~0.33–0.41
+of all attention, despite that arm sitting at chance-level PR-AUC on the honest axes) — and the
+attention mass is fairly flat elsewhere (~0.02–0.05 per arm). When the sensitivity fit removes the
+three synthetic-modality arms, the mass re-concentrates further onto the same scorer block (gmm
+0.41 → 0.51) with test metrics nearly unchanged (0.1076 → 0.1064) — the sensitivity story: the
+pool's shape is robust to the drop, but nothing about it creates separation the inputs did not
+have. With 13–24 test positives these weights are descriptive, not inferential.
+
+### 7.5 Determinism
+
+- **OOF caches (two-run bitwise agreement).** The 19-arm × 3-axis caches were built twice in
+  independent processes: 45/57 arm-axis npz files were bit-identical (git reported no diff despite
+  a full rewrite). The 12 that differed are exactly the threaded-BLAS-sensitive scorers
+  (`latent-cluster-anom`, `latent-cosine-centroid`, `latent-gmm-density`, `latent-logistic` × 3
+  axes) built before the CPU thread pin landed; rebuilt under the forced single-thread pin and
+  re-verified — 12/12 PASS (bit-identical re-runs, `--run-stack-base --verify`).
+- **Fold integrity (nb17 cell 4, every arm × every axis).** Per-fold `fit+fold` row and positive
+  sums equal the TRAIN totals; the committed fold assignments reproduce the deterministic greedy
+  assignment exactly; every cached npz is identity-aligned to the enriched frame (match asserted
+  on all three identity fields, TRAIN and TEST); per-fold disjointness probes pass on the cached
+  arrays themselves. Fit sizes 3057–3882 (random-grouped), 3234–3976 (grouped), 2526–3776
+  (chronological); smallest fold positives 14/14/10.
+- **GPU meta training (three stacked root causes found by probe and fixed).** (1) `_FTTNet`
+  parameters came from `torch.empty` with no init — CUDA garbage often carries NaN/1e38 bit
+  patterns; the probe showed FORWARD-NaN at epoch 0 batch 0 with finite inputs. Fixed with seeded
+  `normal_(std=0.02)` init. (2) Even fit-able runs drifted bitwise: flash + memory-efficient SDPA
+  backward and cublas split-k accumulate with atomics, which `cudnn.deterministic` does not cover —
+  the probe showed whole different trajectories across processes (12 vs 26 epochs, val PR-AUC
+  0.018 vs 0.389). Fixed: math-SDPA-only + `torch.use_deterministic_algorithms(True)` in
+  `_seed_everything`, `CUBLAS_WORKSPACE_CONFIG=:4096:8` forced before CUDA init. (3) Grad-norm
+  clipping (1.0) kept as a spike guard, uniform across torch variants. Probe verdict: attn + ftt
+  sha256 digests of (weights, val probas) bitwise identical in-process AND across processes.
+- **nb17 ↔ CLI contract.** Identity-aligned meta matrix rebuild max |delta| = 0.0 over 5302 ×
+  1434; `meta-attn`/`meta-logit`/`meta-blend` re-runs 19 metric fields byte-identical; **all 16
+  meta rows byte-identical to the canonical JSONL (CLI == notebook)**; the four attention
+  diagnostics tables match the CLI-written JSONs bitwise. No wall-clock fields anywhere.
+
+### 7.6 Interpretation (honest read)
+
+- **The pre-registered PRIMARY null holds — this was the expected outcome, not a failure.** All
+  five meta variants cover chance (lowest CI bound 0.0095 vs chance 0.013306). Stacking adds
+  capacity, not information: the OOF arm probabilities it reads are themselves at-chance on the
+  customer-disjoint axes (F0-F4), the latent block is the representation F5 showed carries ~no
+  transferable signal, and the tabular block is the arms' own feature space. A second-level model
+  cannot manufacture separation its inputs do not contain. `meta-attn` posts the nominally best
+  PRIMARY number of the whole table (0.0240 vs dictionary 0.0231) — a 9×10⁻⁴ margin inside a
+  table of 48 comparisons, both CIs overlapping the other to the last digit that matters; the
+  honest verdict is "indistinguishable from its best single input".
+- **Stacking never beats its best input on any axis.** random-grouped: dictionary 0.0231 ≈
+  meta-attn 0.0240. grouped: sequential-lstm 0.0353 > every meta variant (best meta 0.0201).
+  chronological: face-features 0.2617 > every meta variant (best meta 0.1076). With 11–24 test
+  positives and percentile bootstrap CIs this is not a photo-finish question — the gaps are the
+  size of the CIs themselves. The zero-fit reference (`meta-blend`) landing within ~2× of the
+  learned variants on every axis is the quiet confirmation: there is no complementarity between
+  arms for a second level to harvest.
+- **The blend's scale wart is on the record.** `meta-blend` nanmeans RAW arm outputs whose scales
+  differ wildly (gmm's negative log-likelihood −60..−5, distance scores ~0.9–1.5, calibrated
+  probas 0..1), so it is dominated by the gmm scale (negative frozen thresholds −0.82/−2.56
+  observed). The learned variants absorb scale (logit standardizes, trees split by rank,
+  attention/FTT embed); the blend, by design, cannot. Its near-null is partly a scale artifact of
+  the zero-fit reference, not evidence about arm informativeness — and the anomaly arms' "proba"
+  columns are scores, not calibrated probabilities, which the protocol tolerates (thresholds are
+  rank-based) but the blend does not.
+- **The chronological "separations" are the known artifact axis, not stacking value.** Four meta
+  rows separate on the CI bound there — while sitting at less than half that axis's best single
+  arm (0.2617, the identity/novelty number F4 already flagged). The meta model inherits the
+  artifact through its inputs (the OOF columns include the same face/tabular information the
+  base arms read; the chronological split lets test rows see their own customers' rows in every
+  fit carve). read as: the axis lifts, the second level does not fix, amplify or purify anything.
+- **Multiplicity, on the record.** 5 variants × 3 axes + 1 sensitivity fit = 16 reported fits
+  (48 axis-variant comparisons with CIs) over 13–24 test positives; the nominally best rows are a
+  selection effect, not a discovery. `meta-attn-sens` is **labeled sensitivity, not a purity
+  certificate**: dropping three synthetic-modality arms changes the attention re-concentration
+  and leaves test metrics within noise (0.1076 → 0.1064, CIs overlapping) — a robustness probe of
+  the pool's shape, not evidence that any subset of arms is pure or that purity was achieved.
+- **What F6 delivers** is the machinery: a leak-free OOF stack inside the one runner protocol —
+  new arms drop in as proba columns, skipped arms become mask flags, folds are deterministic and
+  asserted (identity + per-fold disjointness), caches are byte-stable and re-verifiable, and the
+  whole layer re-runs end-to-end in minutes. Ready for the day the dataset outgrows the null —
+  the same hand F5's machinery is waiting for.
+
+### 7.7 F6 open items
+
+- Meta rows omit the `cv_*` fields by design (single-carve protocol, §7.2). If schema uniformity
+  across base/meta rows matters downstream, a grouped-CV-over-OOF variant is the natural
+  follow-up — deliberately NOT built here (it would reuse the folds the OOF features came from;
+  the honest generalization signal for a meta model is the meta-val carve + test, not CV).
+- The blend reads raw arm outputs; if a future round gives the blend a rank-transform or z-scores
+  the anomaly scorers, the zero-fit reference becomes scale-coherent — a one-line matrix change,
+  left out of F6 to keep the pre-registered definition intact.
+- GPU determinism for the torch variants relies on math-SDPA-only + deterministic algorithms +
+  the pinned cublas workspace; if a future arm or variant needs a kernel without a deterministic
+  implementation, the contract (byte-identical re-runs) will fail loudly — that is the intended
+  behaviour, but it bounds what can be added without revisiting the pin.
+- No new dependency was introduced; nothing to pin. `stack.py` uses numpy/pandas/sklearn/xgboost/
+  torch only — all already in the F0 pins. Scope boundary respected: no new base arms, no changes
+  to existing arm definitions/splits/recorded rows, SEC (FOC-181), merge to main, push — all out
+  of F6.
