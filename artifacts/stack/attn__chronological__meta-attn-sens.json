@@ -1,0 +1,47 @@
+{
+  "arm_names": [
+    "xgb-baseline",
+    "xgb-client",
+    "dictionary",
+    "sce",
+    "gbdt-ensemble",
+    "tabnet",
+    "timesfm-features",
+    "sequential-lstm",
+    "sequential-transformer",
+    "text-features-minilm-l6",
+    "latent-fusion",
+    "latent-centroid-dist",
+    "latent-cosine-centroid",
+    "latent-cluster-anom",
+    "latent-gmm-density",
+    "latent-logistic"
+  ],
+  "axis": "chronological",
+  "drop_arms": [
+    "latent-nn-dist",
+    "face-features",
+    "demo-features"
+  ],
+  "epochs": 31,
+  "mean_attention": {
+    "dictionary": 0.060956135392189026,
+    "gbdt-ensemble": 0.0194627046585083,
+    "latent-centroid-dist": 0.03980502486228943,
+    "latent-cluster-anom": 0.07974793761968613,
+    "latent-cosine-centroid": 0.025608785450458527,
+    "latent-fusion": 0.029183687642216682,
+    "latent-gmm-density": 0.512870192527771,
+    "latent-logistic": 0.027328625321388245,
+    "sce": 0.023459291085600853,
+    "sequential-lstm": 0.020179346203804016,
+    "sequential-transformer": 0.022785428911447525,
+    "tabnet": 0.02969520352780819,
+    "text-features-minilm-l6": 0.02993975393474102,
+    "timesfm-features": 0.03799637407064438,
+    "xgb-baseline": 0.017216678708791733,
+    "xgb-client": 0.023764822632074356
+  },
+  "val_pr_auc": 0.5783430368433036,
+  "variant": "meta-attn-sens"
+}
