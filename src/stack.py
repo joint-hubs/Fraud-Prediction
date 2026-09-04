@@ -33,10 +33,11 @@ Leak-free contract (asserted, not assumed):
   * every fit is re-seeded (seed 42; torch.manual_seed + cudnn.deterministic).
   * npz serialization is byte-deterministic (fixed zip timestamps), so a
     --verify re-run must reproduce the cached files bit-for-bit (AC1). CPU
-    math runs single-threaded (env pinned at import, see below) because
+    math runs single-threaded (env forced at import, see below) because
     threaded BLAS/OpenMP reductions are 1-ulp nondeterministic — found via
     latent-cluster-anom's KMeans; rebuild caches ONLY through this module's
-    CLI so the pin is active before numpy loads.
+    CLI so the pin is active before numpy loads (nb17's env cell forces the
+    same values before its first numpy import, keeping kernel == CLI).
 
 Deviation note (deliberate): meta rows carry no cv_* keys. The base layer IS
 the out-of-fold generalization signal; a row-stratified CV on top of OOF
@@ -67,7 +68,7 @@ from pathlib import Path
 # the bit-identical re-run contract. Pin single-threaded CPU math BEFORE numpy
 # loads; must stay the first project import in the CLI path (see module note).
 for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
-    os.environ.setdefault(_var, "1")
+    os.environ[_var] = "1"  # force (not setdefault): nb17's kernel does the same
 
 import numpy as np
 import pandas as pd
